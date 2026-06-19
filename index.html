@@ -45,7 +45,7 @@
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
     import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-    import { getFirestore, doc, getDoc, setDoc, addDoc, collection, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    import { getFirestore, doc, getDoc, setDoc, addDoc, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
     // Firebaseの初期設定
     let db = null;
@@ -98,6 +98,7 @@
         drawings: [], // { image: dataUrl, name: 'ひらがな', startChar: 'あ', endChar: 'い' }
         archives: [], // 過去のゲーム履歴
         selectedArchive: null, // 詳細表示用
+        isConfirmingDelete: false, // 削除確認中フラグ
         isSyncing: false // データベース同期中のフラグ
     };
 
@@ -449,12 +450,47 @@
 
     function openArchiveDetail(index) {
         state.selectedArchive = state.archives[index];
+        state.isConfirmingDelete = false; // モーダルを開くときは確認フラグをリセット
         render();
     }
 
     function closeArchiveDetail() {
         state.selectedArchive = null;
+        state.isConfirmingDelete = false;
         render();
+    }
+
+    // アーカイブ削除処理（LocalStorageとFirestoreから削除）
+    async function deleteArchive() {
+        if (!state.selectedArchive) return;
+        
+        state.isSyncing = true;
+        render();
+        
+        try {
+            const targetId = state.selectedArchive.id;
+            
+            // 1. メモリとLocalStorageから削除
+            state.archives = state.archives.filter(arch => arch.id !== targetId);
+            localStorage.setItem('shiritori_archives_local', JSON.stringify(state.archives));
+            
+            // 2. Firebase Firestoreから削除
+            if (db && user && targetId) {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives', targetId);
+                await deleteDoc(docRef);
+            }
+            
+            showToast('アーカイブをさくじょしました！');
+        } catch (error) {
+            console.error("Error deleting archive:", error);
+            showToast('さくじょに失敗しました。');
+        } finally {
+            state.selectedArchive = null;
+            state.isConfirmingDelete = false;
+            state.isSyncing = false;
+            render();
+            loadArchives(); // 最新状態に完全同期
+        }
     }
 
     function showToast(message) {
@@ -662,6 +698,11 @@
     window.revealAll = revealAll;
     window.openArchiveDetail = openArchiveDetail;
     window.closeArchiveDetail = closeArchiveDetail;
+    window.deleteArchive = deleteArchive;
+    window.setConfirmDelete = function(val) {
+        state.isConfirmingDelete = val;
+        render();
+    };
     window.syncDatabaseForce = loadArchives;
     window.switchTab = function(tabName) {
         activeKeyboardTab = tabName;
@@ -1234,6 +1275,31 @@
 
         const arch = state.selectedArchive;
         
+        // 削除ボタン・エリアの出し分けUI
+        let deleteAreaHtml = '';
+        if (state.isConfirmingDelete) {
+            deleteAreaHtml = `
+                <div class="bg-rose-50 border border-rose-200 rounded-xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 animate-pulse">
+                    <span class="text-xs font-black text-rose-700">⚠️ 本当にこの作品をさくじょしてもいいですか？</span>
+                    <div class="flex gap-2">
+                        <button onclick="window.deleteArchive()" class="bg-rose-600 hover:bg-rose-700 text-white font-extrabold px-4 py-1.5 rounded-lg text-xs transition-colors flex items-center gap-1">
+                            <i class="fa-solid fa-trash-can"></i> はい、けします
+                        </button>
+                        <button onclick="window.setConfirmDelete(false)" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-extrabold px-4 py-1.5 rounded-lg text-xs transition-colors">
+                            キャンセル
+                        </button>
+                    </div>
+                </div>
+            `;
+        } else {
+            deleteAreaHtml = `
+                <button onclick="window.setConfirmDelete(true)" class="text-slate-400 hover:text-rose-600 font-bold text-xs flex items-center gap-1 py-2 px-3 rounded-lg hover:bg-rose-50 transition-all">
+                    <i class="fa-regular fa-trash-can"></i>
+                    <span>この作品をさくじょする</span>
+                </button>
+            `;
+        }
+        
         container.innerHTML = `
             <div class="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
                 <div class="bg-white rounded-3xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden transition-all transform scale-100">
@@ -1301,8 +1367,12 @@
                         </div>
                     </div>
 
-                    <div class="p-4 border-t border-slate-100 flex justify-end bg-slate-50">
-                        <button onclick="window.closeArchiveDetail()" class="bg-slate-700 hover:bg-slate-800 text-white font-extrabold py-2 px-6 rounded-xl text-sm transition-colors">
+                    <div class="p-4 border-t border-slate-100 flex flex-col sm:flex-row justify-between items-center gap-3 bg-slate-50">
+                        <!-- 削除操作エリア -->
+                        <div class="w-full sm:w-auto">
+                            ${deleteAreaHtml}
+                        </div>
+                        <button onclick="window.closeArchiveDetail()" class="w-full sm:w-auto bg-slate-700 hover:bg-slate-800 text-white font-extrabold py-2 px-6 rounded-xl text-sm transition-colors">
                             とじる
                         </button>
                     </div>
