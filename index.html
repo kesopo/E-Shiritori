@@ -101,6 +101,9 @@
         isSyncing: false // データベース同期中のフラグ
     };
 
+    // モジュール外（HTMLのonclick属性等）からstateに安全にアクセスできるようグローバルに露出
+    window.state = state;
+
     // お絵かきキャンバスの状態
     let canvas, ctx;
     let isDrawing = false;
@@ -444,8 +447,8 @@
         loadArchives();
     }
 
-    function openArchiveDetail(archive) {
-        state.selectedArchive = archive;
+    function openArchiveDetail(index) {
+        state.selectedArchive = state.archives[index];
         render();
     }
 
@@ -907,7 +910,7 @@
                         ` : `
                             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                                 ${state.archives.map((arch, index) => `
-                                    <div onclick="window.openArchiveDetail(state.archives[${index}])" 
+                                    <div onclick="window.openArchiveDetail(${index})" 
                                         class="bg-white border border-slate-100 hover:border-indigo-100 p-4 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group flex flex-col justify-between">
                                         <div>
                                             <div class="flex justify-between items-start gap-2 mb-3">
