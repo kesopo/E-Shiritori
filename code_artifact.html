@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>絵しりとりギャラリー</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Google Fonts: M PLUS Rounded 1c (かわいい丸文字) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;700;900&display=swap" rel="stylesheet">
+    <!-- Font Awesome (アイコン用) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        body {
+            font-family: 'M PLUS Rounded 1c', sans-serif;
+            background-color: #fefcf0;
+        }
+        /* カスタムスクロールバー */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+        /* キャンバス用スタイル */
+        canvas {
+            touch-action: none;
+        }
+    </style>
+</head>
+<body class="min-h-screen text-slate-800 flex flex-col justify-between">
+
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, doc, getDoc, setDoc, addDoc, collection, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Firebaseの初期設定
+    let db = null;
+    let auth = null;
+    let user = null;
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'eshiritori-app-id';
+
+    // ひらがなリスト（お題生成用）
+    const HIRAGANA_POOL = [
+        'あ', 'い', 'う', 'え', 'お',
+        'か', 'き', 'く', 'け', 'こ',
+        'さ', 'し', 'す', 'せ', 'そ',
+        'た', 'ち', 'つ', 'て', 'と',
+        'な', 'に', 'ぬ', 'ね', 'の',
+        'は', 'ひ', 'ふ', 'へ', 'ほ',
+        'ま', 'み', 'む', 'め', 'も',
+        'や', 'ゆ', 'よ',
+        'ら', 'り', 'る', 'れ', 'ろ',
+        'わ'
+    ];
+
+    // あいうえお表の文字データ (横向きレイアウト: 横があかさたな...、縦があいうえお...)
+    const HIRAGANA_TABLES = {
+        seion: [
+            ['あ', 'か', 'さ', 'た', 'な', 'は', 'ま', 'や', 'ら', 'わ'],
+            ['い', 'き', 'し', 'ち', 'に', 'ひ', 'み', '　', 'り', '　'],
+            ['う', 'く', 'す', 'つ', 'ぬ', 'ふ', 'む', 'ゆ', 'る', 'を'],
+            ['え', 'け', 'せ', 'て', 'ね', 'へ', 'め', '　', 'れ', '　'],
+            ['お', 'こ', 'そ', 'と', 'の', 'ほ', 'も', 'よ', 'ろ', 'ん']
+        ],
+        dakuon: [
+            ['が', 'ざ', 'だ', 'ば', 'ぱ'],
+            ['ぎ', 'じ', 'ぢ', 'び', 'ぴ'],
+            ['ぐ', 'ず', 'づ', 'ぶ', 'ぷ'],
+            ['げ', 'ぜ', 'で', 'べ', 'ぺ'],
+            ['ご', 'ぞ', 'ど', 'ぼ', 'ぽ']
+        ],
+        yoon: [
+            ['ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ'],
+            ['ゃ', 'ゅ', 'ょ', 'っ', 'ー']
+        ]
+    };
+
+    // ゲーム状態
+    const state = {
+        screen: 'top', // 'top', 'game', 'input', 'result'
+        currentStep: 0, // 0 ~ 11 (合計12回)
+        startChar: '', // 最初の文字
+        endChar: '', // 最後の文字（12枚目の終了指定）
+        drawings: [], // { image: dataUrl, name: 'ひらがな', startChar: 'あ', endChar: 'い' }
+        archives: [], // 過去のゲーム履歴
+        selectedArchive: null, // 詳細表示用
+        isSyncing: false // データベース同期中のフラグ
+    };
+
+    // お絵かきキャンバスの状態
+    let canvas, ctx;
+    let isDrawing = false;
+    let drawColor = '#1e293b';
+    let drawLineWidth = 6;
+    let drawHistory = []; // Undo用
+
+    // 選択中の名前入力（ひらがな）
+    let currentInputName = '';
+
+    // あいうえお表の現在のアクティブタブ
+    let activeKeyboardTab = 'seion';
+
+    // 1. ローカルキャッシュからの超高速復元を先に行う
+    function initLocalCache() {
+        const localData = localStorage.getItem('shiritori_archives_local');
+        if (localData) {
+            try {
+                state.archives = JSON.parse(localData);
+            } catch (e) {
+                console.error("Localstorage parse error:", e);
+            }
+        }
+    }
+
+    // 2. アーカイブの読み込み
+    async function loadArchives() {
+        if (!db || !user) {
+            console.warn("Skipping DB fetch: Firebase DB or User not ready.");
+            return;
+        }
+        
+        state.isSyncing = true;
+        render(); // ローディング表示に切り替え
+        
+        try {
+            // RULE 1: Strict Paths
+            const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives');
+            const querySnapshot = await getDocs(colRef);
+            const fbArchives = [];
+            
+            querySnapshot.forEach((doc) => {
+                fbArchives.push({ id: doc.id, ...doc.data() });
+            });
+            
+            // 日付が新しい順にソート（RULE 2: メモリ上でソート）
+            fbArchives.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            
+            state.archives = fbArchives;
+            // ローカルストレージを最新状態で同期
+            localStorage.setItem('shiritori_archives_local', JSON.stringify(fbArchives));
+        } catch (error) {
+            console.error("Error fetching Firestore archives:", error);
+        } finally {
+            state.isSyncing = false;
+            render();
+        }
+    }
+
+    // 3. Firebase初期化＆ログイン認証ライフサイクル
+    async function initFirebaseAndAuth() {
+        try {
+            if (typeof __firebase_config !== 'undefined') {
+                const firebaseConfig = JSON.parse(__firebase_config);
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // 認証リスナーの設定（認証完了後に読み込みをキックする）
+                onAuthStateChanged(auth, async (u) => {
+                    if (u) {
+                        user = u;
+                        console.log("Authenticated user:", u.uid);
+                        await loadArchives();
+                    } else {
+                        user = null;
+                        render();
+                    }
+                });
+
+                // ログイン処理を開始 (RULE 3: Auth Before Queries)
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } else {
+                console.warn("No firebase config found. Running in local-only mode.");
+                render();
+            }
+        } catch (e) {
+            console.error("Firebase Initialisation or Auth Failed:", e);
+            render();
+        }
+    }
+
+    // 読み込み時初期化
+    window.onload = function() {
+        initLocalCache(); // まず手元のキャッシュを読み込んで仮表示
+        render();
+        initFirebaseAndAuth(); // その後非同期でFirebase連携を開始して最新化
+    };
+
+    // アーカイブの保存
+    async function saveArchiveToDB(archiveData) {
+        state.archives.unshift(archiveData); // メモリに即追加してUXを高める
+        localStorage.setItem('shiritori_archives_local', JSON.stringify(state.archives));
+        render();
+
+        if (db && user) {
+            try {
+                const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives');
+                await addDoc(colRef, archiveData);
+                // 最新の状態に同期する
+                await loadArchives();
+            } catch (error) {
+                console.error("Error saving to Firestore:", error);
+            }
+        }
+    }
+
+    // ひらがなの清音化・標準化（しりとり判定用）
+    function normalizeChar(char) {
+        if (!char) return '';
+        // 小文字を大文字に変換
+        const map = {
+            'ぁ': 'あ', 'ぃ': 'い', 'ぅ': 'う', 'ぇ': 'え', 'ぉ': 'お',
+            'っ': 'つ', 'ゃ': 'や', 'ゅ': 'ゆ', 'ょ': 'よ', 'ゎ': 'わ'
+        };
+        let normalized = map[char] || char;
+        
+        // 濁音・半濁音を清音にする
+        const dakuonMap = {
+            'が': 'か', 'ぎ': 'き', 'ぐ': 'く', 'げ': 'け', 'ご': 'こ',
+            'ざ': 'さ', 'じ': 'し', 'ず': 'す', 'ぜ': 'せ', 'ぞ': 'そ',
+            'だ': 'た', 'ぢ': 'ち', 'づ': 'つ', 'で': 'て', 'ど': 'と',
+            'ば': 'は', 'び': 'ひ', 'ぶ': 'ふ', 'べ': 'へ', 'ぼ': 'ほ',
+            'ぱ': 'は', 'ぴ': 'ひ', 'ぷ': 'ふ', 'ぺ': 'へ', 'ぽ': 'ほ'
+        };
+        return dakuonMap[normalized] || normalized;
+    }
+
+    // しりとり判定
+    function checkShiritoriResults(drawings, startChar, endChar) {
+        const results = [];
+        let totalSuccess = true;
+
+        for (let i = 0; i < drawings.length; i++) {
+            const current = drawings[i];
+            const name = current.name || '';
+            const first = name.charAt(0);
+            const last = name.charAt(name.length - 1);
+
+            let isOk = true;
+            let reason = '';
+
+            if (name.length === 0) {
+                isOk = false;
+                reason = '名前が入力されていません';
+            } else {
+                if (i === 0) {
+                    const reqNormal = normalizeChar(startChar);
+                    const gotNormal = normalizeChar(first);
+                    if (reqNormal !== gotNormal) {
+                        isOk = false;
+                        reason = `「${startChar}」から始まっていません`;
+                    }
+                } else {
+                    const prevName = drawings[i - 1].name || '';
+                    const prevLast = prevName.charAt(prevName.length - 1);
+                    const prevLastNormal = normalizeChar(prevLast);
+                    const gotNormal = normalizeChar(first);
+                    if (prevLastNormal !== gotNormal) {
+                        isOk = false;
+                        reason = `前の絵の最後「${prevLast}」に繋がっていません`;
+                    }
+                }
+
+                if (last === 'ん') {
+                    isOk = false;
+                    reason = '「ん」で終わっています';
+                }
+
+                if (i === drawings.length - 1) {
+                    const reqEndNormal = normalizeChar(endChar);
+                    const gotEndNormal = normalizeChar(last);
+                    if (reqEndNormal !== gotEndNormal) {
+                        isOk = false;
+                        reason = `最後の文字が「${endChar}」になっていません`;
+                    }
+                }
+            }
+
+            if (!isOk) {
+                totalSuccess = false;
+            }
+
+            results.push({
+                index: i,
+                isOk: isOk,
+                reason: reason,
+                name: name,
+                startChar: first,
+                endChar: last
+            });
+        }
+
+        return {
+            isSuccess: totalSuccess,
+            details: results
+        };
+    }
+
+    // ゲーム遷移・ゲームロジック
+    function startNewGame() {
+        const startIdx = Math.floor(Math.random() * HIRAGANA_POOL.length);
+        let endIdx = Math.floor(Math.random() * HIRAGANA_POOL.length);
+        while (startIdx === endIdx || HIRAGANA_POOL[endIdx] === 'ん') {
+            endIdx = Math.floor(Math.random() * HIRAGANA_POOL.length);
+        }
+
+        state.screen = 'game';
+        state.currentStep = 0;
+        state.startChar = HIRAGANA_POOL[startIdx];
+        state.endChar = HIRAGANA_POOL[endIdx];
+        state.drawings = [];
+        
+        render();
+        initCanvas();
+    }
+
+    function goToInputScreen() {
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6); 
+        state.drawings[state.currentStep] = {
+            image: dataUrl,
+            name: '',
+            startChar: state.currentStep === 0 ? state.startChar : drawingsStartChar(state.currentStep)
+        };
+
+        state.screen = 'input';
+        currentInputName = '';
+        activeKeyboardTab = 'seion';
+        render();
+    }
+
+    function drawingsStartChar(step) {
+        if (step === 0) return state.startChar;
+        const prev = state.drawings[step - 1];
+        if (prev && prev.name) {
+            return prev.name.charAt(prev.name.length - 1);
+        }
+        return '？';
+    }
+
+    function handleNameInput(char) {
+        if (currentInputName.length < 10) {
+            currentInputName += char;
+            render();
+        }
+    }
+
+    function deleteLastChar() {
+        if (currentInputName.length > 0) {
+            currentInputName = currentInputName.slice(0, -1);
+            render();
+        }
+    }
+
+    function confirmNameInput() {
+        if (currentInputName.trim() === '') {
+            showToast('おなまえをにゅうりょくしてね！');
+            return;
+        }
+
+        state.drawings[state.currentStep].name = currentInputName;
+
+        if (state.currentStep < 11) {
+            state.currentStep++;
+            state.screen = 'game';
+            render();
+            initCanvas();
+        } else {
+            finishGame();
+        }
+    }
+
+    function finishGame() {
+        state.screen = 'result';
+        
+        const checkResult = checkShiritoriResults(state.drawings, state.startChar, state.endChar);
+        
+        const now = new Date();
+        const dateString = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+        const newArchive = {
+            createdAt: now.toISOString(),
+            createdAtString: dateString,
+            startChar: state.startChar,
+            endChar: state.endChar,
+            isSuccess: checkResult.isSuccess,
+            drawings: state.drawings,
+            details: checkResult.details
+        };
+
+        saveArchiveToDB(newArchive);
+        render();
+        startResultReveal();
+    }
+
+    let revealStep = -1;
+    function startResultReveal() {
+        revealStep = -1;
+        const btn = document.getElementById('reveal-next-btn');
+        if (btn) btn.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function revealNext() {
+        if (revealStep < 11) {
+            revealStep++;
+            render();
+            const card = document.getElementById(`result-card-${revealStep}`);
+            if (card) {
+                card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                card.classList.add('scale-105', 'ring-4', 'ring-yellow-400');
+                setTimeout(() => {
+                    card.classList.remove('scale-105', 'ring-4', 'ring-yellow-400');
+                }, 1000);
+            }
+        }
+    }
+
+    function revealAll() {
+        revealStep = 11;
+        render();
+    }
+
+    function goBackToTop() {
+        state.screen = 'top';
+        render();
+        // トップに戻る際に最新状態への同期も行う
+        loadArchives();
+    }
+
+    function openArchiveDetail(archive) {
+        state.selectedArchive = archive;
+        render();
+    }
+
+    function closeArchiveDetail() {
+        state.selectedArchive = null;
+        render();
+    }
+
+    function showToast(message) {
+        const toast = document.createElement('div');
+        toast.className = "fixed bottom-10 left-1/2 transform -translate-x-1/2 bg-slate-800 text-white px-6 py-3 rounded-full shadow-lg text-sm z-50 transition-opacity duration-300";
+        toast.innerText = message;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            setTimeout(() => toast.remove(), 300);
+        }, 2000);
+    }
+
+    // キャンバスお絵描きシステム
+    function initCanvas() {
+        canvas = document.getElementById('paint-canvas');
+        if (!canvas) return;
+        ctx = canvas.getContext('2d');
+        
+        canvas.width = 500;
+        canvas.height = 500;
+        
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        
+        drawHistory = [];
+        saveDrawState();
+
+        canvas.addEventListener('mousedown', startDrawing);
+        canvas.addEventListener('mousemove', draw);
+        canvas.addEventListener('mouseup', stopDrawing);
+        canvas.addEventListener('mouseleave', stopDrawing);
+
+        canvas.addEventListener('touchstart', startDrawingTouch, { passive: false });
+        canvas.addEventListener('touchmove', drawTouch, { passive: false });
+        canvas.addEventListener('touchend', stopDrawing);
+    }
+
+    function saveDrawState() {
+        if (drawHistory.length >= 20) {
+            drawHistory.shift();
+        }
+        drawHistory.push(canvas.toDataURL());
+    }
+
+    function undoDraw() {
+        if (drawHistory.length > 1) {
+            drawHistory.pop();
+            const previousState = drawHistory[drawHistory.length - 1];
+            const img = new Image();
+            img.src = previousState;
+            img.onload = () => {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0);
+            };
+        } else if (drawHistory.length === 1) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            drawHistory = [];
+            saveDrawState();
+        }
+    }
+
+    function clearCanvas() {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        saveDrawState();
+    }
+
+    function getMousePos(e) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: (e.clientX - rect.left) * (canvas.width / rect.width),
+            y: (e.clientY - rect.top) * (canvas.height / rect.height)
+        };
+    }
+
+    function startDrawing(e) {
+        isDrawing = true;
+        ctx.beginPath();
+        const pos = getMousePos(e);
+        ctx.moveTo(pos.x, pos.y);
+        ctx.strokeStyle = drawColor;
+        ctx.lineWidth = drawLineWidth;
+    }
+
+    function draw(e) {
+        if (!isDrawing) return;
+        e.preventDefault();
+        const pos = getMousePos(e);
+        ctx.lineTo(pos.x, pos.y);
+        ctx.stroke();
+    }
+
+    function startDrawingTouch(e) {
+        if (e.touches.length === 1) {
+            e.preventDefault();
+            isDrawing = true;
+            ctx.beginPath();
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.touches[0];
+            const x = (touch.clientX - rect.left) * (canvas.width / rect.width);
+            const y = (touch.clientY - rect.top) * (canvas.height / rect.height);
+            ctx.moveTo(x, y);
+            ctx.strokeStyle = drawColor;
+            ctx.lineWidth = drawLineWidth;
+        }
+    }
+
+    function drawTouch(e) {
+        if (!isDrawing) return;
+        e.preventDefault();
+        if (e.touches.length === 1) {
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.touches[0];
+            const x = (touch.clientX - rect.left) * (canvas.width / rect.width);
+            const y = (touch.clientY - rect.top) * (canvas.height / rect.height);
+            ctx.lineTo(x, y);
+            ctx.stroke();
+        }
+    }
+
+    function stopDrawing() {
+        if (isDrawing) {
+            isDrawing = false;
+            ctx.closePath();
+            saveDrawState();
+        }
+    }
+
+    function changeColor(color) {
+        drawColor = color;
+        renderColorPalette();
+    }
+
+    function changeLineWidth(width) {
+        drawLineWidth = width;
+        renderWidthPalette();
+    }
+
+    function renderColorPalette() {
+        const colors = [
+            { hex: '#1e293b', label: '黒' },
+            { hex: '#ef4444', label: '赤' },
+            { hex: '#3b82f6', label: '青' },
+            { hex: '#22c55e', label: '緑' },
+            { hex: '#eab308', label: '黄' },
+            { hex: '#ec4899', label: 'ピンク' },
+            { hex: '#a855f7', label: '紫' },
+            { hex: '#ffffff', label: '消しゴム' }
+        ];
+
+        const paletteEl = document.getElementById('color-palette');
+        if (!paletteEl) return;
+        
+        paletteEl.innerHTML = colors.map(c => `
+            <button onclick="window.changeColor('${c.hex}')" 
+                class="w-10 h-10 rounded-full border-2 transition-all transform hover:scale-110 flex items-center justify-center
+                ${c.hex === '#ffffff' ? 'border-dashed border-slate-400' : 'border-white shadow'} 
+                ${drawColor === c.hex ? 'ring-4 ring-offset-2 ring-indigo-500 scale-105' : ''}" 
+                style="background-color: ${c.hex};"
+                title="${c.label}">
+                ${c.hex === '#ffffff' ? '<i class="fa-solid fa-eraser text-slate-600 text-xs"></i>' : ''}
+                ${drawColor === c.hex && c.hex !== '#ffffff' ? '<i class="fa-solid fa-check text-white text-xs drop-shadow"></i>' : ''}
+            </button>
+        `).join('');
+    }
+
+    function renderWidthPalette() {
+        const widths = [
+            { size: 3, label: '極細' },
+            { size: 6, label: 'ふつう' },
+            { size: 12, label: '太' },
+            { size: 24, label: '極太' }
+        ];
+
+        const widthEl = document.getElementById('width-palette');
+        if (!widthEl) return;
+
+        widthEl.innerHTML = widths.map(w => `
+            <button onclick="window.changeLineWidth(${w.size})" 
+                class="px-3 py-1.5 rounded-lg border text-xs font-bold transition-all flex items-center gap-1.5
+                ${drawLineWidth === w.size ? 'bg-indigo-600 border-indigo-600 text-white shadow' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}">
+                <span class="inline-block rounded-full bg-current" style="width: ${w.size/2 + 2}px; height: ${w.size/2 + 2}px;"></span>
+                ${w.label}
+            </button>
+        `).join('');
+    }
+
+    // グローバル露出
+    window.changeColor = changeColor;
+    window.changeLineWidth = changeLineWidth;
+    window.undoDraw = undoDraw;
+    window.clearCanvas = clearCanvas;
+    window.startNewGame = startNewGame;
+    window.goToInputScreen = goToInputScreen;
+    window.handleNameInput = handleNameInput;
+    window.deleteLastChar = deleteLastChar;
+    window.confirmNameInput = confirmNameInput;
+    window.goBackToTop = goBackToTop;
+    window.revealNext = revealNext;
+    window.revealAll = revealAll;
+    window.openArchiveDetail = openArchiveDetail;
+    window.closeArchiveDetail = closeArchiveDetail;
+    window.syncDatabaseForce = loadArchives;
+    window.switchTab = function(tabName) {
+        activeKeyboardTab = tabName;
+        renderKeyboard();
+    };
+
+    // あいうえお表キーボード
+    function renderKeyboard() {
+        const container = document.getElementById('keyboard-container');
+        if (!container) return;
+
+        const tabHtml = `
+            <div class="flex justify-center gap-2 mb-3 bg-slate-100 p-1.5 rounded-xl">
+                <button onclick="window.switchTab('seion')" class="flex-1 py-2 text-xs md:text-sm font-bold rounded-lg transition-all ${activeKeyboardTab === 'seion' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}">清音 (あ-ん)</button>
+                <button onclick="window.switchTab('dakuon')" class="flex-1 py-2 text-xs md:text-sm font-bold rounded-lg transition-all ${activeKeyboardTab === 'dakuon' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}">濁音・半濁音</button>
+                <button onclick="window.switchTab('yoon')" class="flex-1 py-2 text-xs md:text-sm font-bold rounded-lg transition-all ${activeKeyboardTab === 'yoon' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}">拗音・小文字</button>
+            </div>
+        `;
+
+        const rows = HIRAGANA_TABLES[activeKeyboardTab];
+        let keysHtml = '';
+
+        if (activeKeyboardTab === 'seion') {
+            keysHtml = `
+                <div class="overflow-x-auto pb-2">
+                    <div class="grid grid-cols-10 gap-1.5 min-w-[560px] md:min-w-0 justify-center">
+            `;
+            rows.forEach(row => {
+                row.forEach(char => {
+                    if (char.trim() === '' || char === '　') {
+                        keysHtml += `<div class="aspect-square opacity-0 pointer-events-none select-none"></div>`;
+                    } else {
+                        keysHtml += `
+                            <button onclick="window.handleNameInput('${char}')" 
+                                class="aspect-square flex items-center justify-center bg-white border border-slate-200 hover:border-indigo-400 active:bg-indigo-50 rounded-xl text-base font-bold shadow-sm transition-all hover:scale-105 active:scale-95 text-slate-700">
+                                ${char}
+                            </button>
+                        `;
+                    }
+                });
+            });
+            keysHtml += `</div></div>`;
+        } else {
+            keysHtml = `<div class="grid grid-cols-5 gap-1.5 justify-center max-w-md mx-auto">`;
+            rows.forEach(row => {
+                row.forEach(char => {
+                    keysHtml += `
+                        <button onclick="window.handleNameInput('${char}')" 
+                            class="aspect-square flex items-center justify-center bg-white border border-slate-200 hover:border-indigo-400 active:bg-indigo-50 rounded-xl text-base font-bold shadow-sm transition-all hover:scale-105 active:scale-95 text-slate-700">
+                            ${char}
+                        </button>
+                    `;
+                });
+            });
+            keysHtml += `</div>`;
+        }
+
+        container.innerHTML = tabHtml + keysHtml;
+    }
+
+    // ロードマップコンポーネント
+    function getRoadmapHtml() {
+        let html = `
+            <div class="w-full bg-white p-3.5 rounded-2xl border border-slate-200/70 shadow-sm mb-5">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-xs font-black text-slate-500 flex items-center gap-1">
+                        <i class="fa-solid fa-map"></i>
+                        <span>12枚のえしりとりロードマップ</span>
+                    </span>
+                    <span class="text-[10px] text-slate-400 font-bold">
+                        (お絵かき中も常に見れます)
+                    </span>
+                </div>
+                <div class="grid grid-cols-6 sm:grid-cols-12 gap-1.5">
+        `;
+        
+        for (let i = 0; i < 12; i++) {
+            const isCurrent = state.currentStep === i && state.screen !== 'result';
+            const drawing = state.drawings[i];
+            const hasDrawing = !!drawing;
+            const hasName = drawing && drawing.name;
+            
+            let borderClass = 'border-slate-200 bg-slate-50';
+            if (isCurrent) {
+                borderClass = 'border-indigo-500 ring-4 ring-indigo-100 bg-indigo-50/10';
+            } else if (hasDrawing) {
+                borderClass = 'border-emerald-300 bg-emerald-50/5';
+            }
+
+            html += `
+                <div class="aspect-square border rounded-xl flex flex-col justify-between p-1 relative overflow-hidden text-[9px] transition-all ${borderClass}">
+                    <div class="flex justify-between items-center leading-none text-slate-400 font-extrabold mb-0.5">
+                        <span class="${isCurrent ? 'text-indigo-600 font-black' : ''}">${i + 1}</span>
+                        ${i === 0 ? `<span class="bg-indigo-500 text-white rounded px-0.5 text-[8px] transform scale-90 origin-right">始:${state.startChar}</span>` : ''}
+                        ${i === 11 ? `<span class="bg-pink-500 text-white rounded px-0.5 text-[8px] transform scale-90 origin-right">終:${state.endChar}</span>` : ''}
+                    </div>
+                    
+                    <div class="flex-1 flex items-center justify-center min-h-0 relative">
+                        ${hasDrawing ? `
+                            <img src="${drawing.image}" class="w-full h-full object-cover rounded-md bg-white">
+                        ` : `
+                            <span class="text-slate-300 text-[10px] font-bold"><i class="fa-solid fa-question"></i></span>
+                        `}
+                    </div>
+                    
+                    <div class="mt-0.5 h-2.5 flex items-center justify-center gap-0.5 overflow-hidden">
+                        ${hasName ? Array.from({ length: drawing.name.length }).map(() => `
+                            <span class="w-1 h-1 rounded-full bg-slate-700 inline-block"></span>
+                        `).join('') : `
+                            <span class="text-[8px] text-slate-300">-</span>
+                        `}
+                    </div>
+                </div>
+            `;
+        }
+
+        html += `
+                </div>
+            </div>
+        `;
+        return html;
+    }
+
+    // 全体レンダリング
+    function render() {
+        const root = document.getElementById('app-root');
+        if (!root) return;
+
+        let headerHtml = '';
+        if (state.screen !== 'top') {
+            headerHtml = `
+                <header class="bg-white border-b border-slate-100 py-3 px-4 flex justify-between items-center shadow-sm">
+                    <button onclick="window.goBackToTop()" class="flex items-center gap-1 text-slate-500 hover:text-indigo-600 font-bold text-sm transition-all">
+                        <i class="fa-solid fa-house"></i>
+                        <span>トップに戻る</span>
+                    </button>
+                    <div class="flex items-center gap-2">
+                        <span class="bg-yellow-100 text-yellow-800 text-xs px-2.5 py-1 rounded-full font-extrabold flex items-center gap-1">
+                            <i class="fa-solid fa-palette"></i>
+                            しりとり 12枚チャレンジ
+                        </span>
+                    </div>
+                </header>
+            `;
+        }
+
+        let mainContent = '';
+
+        if (state.screen === 'top') {
+            mainContent = `
+                <div class="max-w-4xl mx-auto px-4 py-8 flex flex-col items-center justify-center flex-1">
+                    <div class="text-center mb-10 max-w-lg">
+                        <div class="inline-flex p-4 bg-yellow-100 text-yellow-600 rounded-3xl mb-4 text-5xl animate-bounce">
+                            <i class="fa-solid fa-paint-brush"></i>
+                        </div>
+                        <h1 class="text-4xl md:text-5xl font-black text-indigo-900 tracking-wider mb-3">
+                            絵しりとり<span class="text-yellow-500">ギャラリー</span>
+                        </h1>
+                        <p class="text-sm text-slate-500 font-bold tracking-wide">
+                            お絵描きで繋ぐ12枚の連想絵しりとり！
+                        </p>
+                    </div>
+
+                    <!-- メインメニューカード -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-2xl mb-12">
+                        <button onclick="window.startNewGame()" 
+                            class="bg-gradient-to-br from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white p-8 rounded-3xl shadow-xl hover:shadow-2xl transition-all duration-300 transform hover:-translate-y-1 text-left flex flex-col justify-between group h-64 border-4 border-indigo-200">
+                            <div class="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center text-2xl mb-4 group-hover:rotate-12 transition-transform">
+                                <i class="fa-solid fa-play"></i>
+                            </div>
+                            <div>
+                                <h3 class="text-2xl font-black mb-2">あそびはじめる</h3>
+                                <p class="text-indigo-100 text-sm">ランダムなお題からスタートし、12枚の絵を描いてクリアを目指します。</p>
+                            </div>
+                        </button>
+
+                        <button onclick="document.getElementById('archives-section').scrollIntoView({ behavior: 'smooth' })" 
+                            class="bg-white hover:bg-slate-50 text-slate-700 p-8 rounded-3xl shadow-lg hover:shadow-xl transition-all duration-300 transform hover:-translate-y-1 text-left flex flex-col justify-between group h-64 border-4 border-slate-100">
+                            <div class="w-12 h-12 rounded-2xl bg-yellow-100 text-yellow-600 flex items-center justify-center text-2xl mb-4 group-hover:rotate-12 transition-transform">
+                                <i class="fa-solid fa-images"></i>
+                            </div>
+                            <div>
+                                <h3 class="text-2xl font-black text-slate-800 mb-2">これまでの絵画録</h3>
+                                <p class="text-slate-500 text-sm">過去に描きあげた絵しりとりのアーカイブを鑑賞します。</p>
+                            </div>
+                        </button>
+                    </div>
+
+                    <!-- ルール説明 -->
+                    <div class="bg-white border-2 border-indigo-50/50 p-6 rounded-3xl shadow-sm w-full max-w-2xl mb-12">
+                        <h4 class="text-indigo-900 font-extrabold mb-4 flex items-center gap-2 border-b pb-2">
+                            <i class="fa-solid fa-circle-info text-yellow-500"></i>
+                            あそびかたルール
+                        </h4>
+                        <ul class="text-slate-600 text-sm font-bold space-y-2.5">
+                            <li class="flex items-start gap-2">
+                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">1</span>
+                                <span>最初はランダムな「最初のお題（頭文字）」からはじまる絵を描きます。</span>
+                            </li>
+                            <li class="flex items-start gap-2">
+                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">2</span>
+                                <span>描き終わったら、その絵の名前をあいうえお表（横向き五十音図）から入力します。</span>
+                            </li>
+                            <li class="flex items-start gap-2">
+                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">3</span>
+                                <span>次の人は、前の人の「絵」と「●の文字数」だけを見て、何を描いたか推理してしりとりを繋ぎます。</span>
+                            </li>
+                            <li class="flex items-start gap-2">
+                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">4</span>
+                                <span>最後の12枚目は、指定された「最後の文字」で綺麗に終わるように絵を描く必要があります。</span>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <!-- アーカイブセクション -->
+                    <div id="archives-section" class="w-full max-w-4xl border-t border-slate-200/60 pt-10">
+                        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-6">
+                            <h2 class="text-2xl font-black text-slate-800 flex items-center gap-2">
+                                <i class="fa-solid fa-bookmark text-indigo-500"></i>
+                                あーかいぶ (${state.archives.length}件)
+                            </h2>
+                            
+                            <!-- 同期/手動更新ボタン -->
+                            <div class="flex items-center gap-2 w-full sm:w-auto">
+                                ${state.isSyncing ? `
+                                    <span class="text-xs text-indigo-600 font-bold bg-indigo-50 px-3 py-1.5 rounded-full flex items-center gap-1.5 shadow-sm border border-indigo-100 animate-pulse">
+                                        <i class="fa-solid fa-rotate-right animate-spin"></i>
+                                        データ同期中...
+                                    </span>
+                                ` : `
+                                    <button onclick="window.syncDatabaseForce()" class="text-xs text-slate-600 hover:text-indigo-600 font-bold bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-200 px-3 py-1.5 rounded-full flex items-center gap-1.5 shadow-sm transition-all">
+                                        <i class="fa-solid fa-rotate-right"></i>
+                                        リストを更新する
+                                    </button>
+                                `}
+                            </div>
+                        </div>
+                        
+                        ${state.archives.length === 0 ? `
+                            <div class="text-center bg-white border border-dashed border-slate-200 py-16 rounded-3xl text-slate-400">
+                                <i class="fa-regular fa-image text-4xl mb-3 block"></i>
+                                <span class="font-bold">
+                                    ${state.isSyncing ? 'ただいまデータをロード中です...' : 'まだアーカイブがありません。<br>あそびはじめて作品をのこそう！'}
+                                </span>
+                            </div>
+                        ` : `
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                ${state.archives.map((arch, index) => `
+                                    <div onclick="window.openArchiveDetail(state.archives[${index}])" 
+                                        class="bg-white border border-slate-100 hover:border-indigo-100 p-4 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group flex flex-col justify-between">
+                                        <div>
+                                            <div class="flex justify-between items-start gap-2 mb-3">
+                                                <span class="text-[11px] font-bold text-slate-400">${arch.createdAtString}</span>
+                                                <span class="px-2.5 py-0.5 rounded-full text-xs font-black ${arch.isSuccess ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">
+                                                    ${arch.isSuccess ? '成功' : '失敗'}
+                                                </span>
+                                            </div>
+                                            
+                                            <!-- ミニプレビュー -->
+                                            <div class="flex items-center gap-1.5 mb-3 bg-slate-50 p-2 rounded-xl">
+                                                <img src="${arch.drawings[0]?.image}" onerror="this.src='https://placehold.co/100x100?text=NoImage'" class="w-10 h-10 object-cover rounded bg-white border border-slate-100">
+                                                <i class="fa-solid fa-arrow-right text-[10px] text-slate-300"></i>
+                                                <img src="${arch.drawings[1]?.image}" onerror="this.src='https://placehold.co/100x100?text=NoImage'" class="w-10 h-10 object-cover rounded bg-white border border-slate-100">
+                                                <i class="fa-solid fa-ellipsis text-[10px] text-slate-300"></i>
+                                                <img src="${arch.drawings[11]?.image}" onerror="this.src='https://placehold.co/100x100?text=NoImage'" class="w-10 h-10 object-cover rounded bg-white border border-slate-100">
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="border-t border-slate-100 pt-2.5 flex items-center justify-between">
+                                            <div class="flex items-center gap-1 text-slate-600 font-extrabold text-sm">
+                                                <span class="bg-indigo-50 text-indigo-700 w-5 h-5 rounded-md flex items-center justify-center text-xs font-black">${arch.startChar}</span>
+                                                <span class="text-[10px] text-slate-400">から</span>
+                                                <span class="bg-pink-50 text-pink-700 w-5 h-5 rounded-md flex items-center justify-center text-xs font-black">${arch.endChar}</span>
+                                            </div>
+                                            <span class="text-xs text-indigo-500 font-extrabold group-hover:translate-x-1 transition-transform flex items-center gap-0.5">
+                                                みる <i class="fa-solid fa-chevron-right text-[10px]"></i>
+                                            </span>
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `}
+                    </div>
+                </div>
+            `;
+        } else if (state.screen === 'game') {
+            const isLast = state.currentStep === 11;
+            
+            mainContent = `
+                <div class="max-w-2xl mx-auto px-4 py-6 flex-1 flex flex-col justify-between">
+                    <div>
+                        ${getRoadmapHtml()}
+
+                        <div class="flex items-center justify-between mb-4 bg-slate-100 rounded-2xl p-2.5">
+                            <span class="text-xs font-black text-slate-500">えのステップ</span>
+                            <span class="text-base font-black text-indigo-600">
+                                ${state.currentStep + 1} <span class="text-slate-400 text-xs">/ 12 枚目</span>
+                            </span>
+                            <div class="w-24 bg-slate-200 h-2 rounded-full overflow-hidden">
+                                <div class="bg-indigo-600 h-full transition-all" style="width: ${((state.currentStep + 1) / 12) * 100}%"></div>
+                            </div>
+                        </div>
+
+                        <div class="bg-white border-2 border-dashed border-indigo-200 rounded-3xl p-5 text-center mb-6 shadow-sm">
+                            ${state.currentStep === 0 ? `
+                                <h2 class="text-lg md:text-xl font-black text-slate-700">
+                                    最初のお題「<span class="text-3xl text-indigo-600 font-black inline-block bg-indigo-50 px-3 py-1 rounded-2xl border border-indigo-200 mx-1">${state.startChar}</span>」からはじまる絵を描こう！
+                                </h2>
+                            ` : isLast ? `
+                                <div class="text-xs text-rose-500 font-black mb-1 flex items-center justify-center gap-1">
+                                    <i class="fa-solid fa-triangle-exclamation animate-pulse"></i>
+                                    ラストお絵かき！
+                                </div>
+                                <h2 class="text-lg md:text-xl font-black text-slate-700 leading-relaxed">
+                                    前の人の絵を見てしりとりを繋ぎ、<br class="md:hidden">
+                                    最後が「<span class="text-3xl text-pink-600 font-black inline-block bg-pink-50 px-2.5 py-0.5 rounded-xl border border-pink-200 mx-1">${state.endChar}</span>」で終わる絵を描こう！
+                                </h2>
+                            ` : `
+                                <h2 class="text-lg md:text-xl font-black text-slate-700">
+                                    前の人の絵と「●の数」から推理して、しりとりが繋がる絵を自由に描こう！
+                                </h2>
+                                <p class="text-xs text-slate-400 font-bold mt-1.5">※次の文字（頭文字）のヒントはありません。自分の目で絵を解釈して繋げよう！</p>
+                            `}
+                        </div>
+
+                        <div class="flex flex-col items-center">
+                            <div class="w-full aspect-square max-w-[420px] bg-white border-4 border-slate-700/85 rounded-3xl shadow-lg overflow-hidden relative">
+                                <canvas id="paint-canvas" class="w-full h-full cursor-crosshair"></canvas>
+                            </div>
+
+                            <div class="w-full max-w-[420px] mt-4 space-y-3.5 bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                                <div id="color-palette" class="flex flex-wrap justify-between gap-1.5"></div>
+                                
+                                <div class="flex items-center justify-between gap-3 border-t border-slate-100 pt-3 flex-wrap">
+                                    <div id="width-palette" class="flex items-center gap-1 flex-wrap"></div>
+                                    <div class="flex gap-2">
+                                        <button onclick="window.undoDraw()" class="bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 w-9 h-9 rounded-xl transition-all flex items-center justify-center shadow-sm" title="元に戻す">
+                                            <i class="fa-solid fa-rotate-left"></i>
+                                        </button>
+                                        <button onclick="window.clearCanvas()" class="bg-rose-50 hover:bg-rose-100 active:bg-rose-200 text-rose-600 w-9 h-9 rounded-xl transition-all flex items-center justify-center shadow-sm" title="すべて消去">
+                                            <i class="fa-solid fa-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mt-8 flex justify-center">
+                        <button onclick="window.goToInputScreen()" 
+                            class="w-full max-w-sm bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white font-black py-4 px-8 rounded-3xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 text-lg flex items-center justify-center gap-2">
+                            <span>かけおわった！おなまえ入力へ</span>
+                            <i class="fa-solid fa-arrow-right"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        } else if (state.screen === 'input') {
+            const drawing = state.drawings[state.currentStep];
+            
+            let maskString = '';
+            for (let i = 0; i < currentInputName.length; i++) {
+                maskString += '<span class="w-6 h-6 rounded-full bg-slate-700 inline-block text-white text-xs font-black text-center leading-6 mx-0.5">●</span>';
+            }
+            const remain = 6 - currentInputName.length;
+            let placeholderString = '';
+            for (let i = 0; i < (remain > 0 ? remain : 0); i++) {
+                placeholderString += '<span class="w-6 h-6 rounded-full border border-dashed border-slate-300 inline-block mx-0.5"></span>';
+            }
+
+            mainContent = `
+                <div class="max-w-2xl mx-auto px-4 py-6 flex-1 flex flex-col justify-between">
+                    <div>
+                        ${getRoadmapHtml()}
+
+                        <div class="text-center mb-4">
+                            <h2 class="text-xl font-black text-slate-700">この絵のおなまえは何？</h2>
+                            <p class="text-xs text-slate-400 font-bold">ひらがなであいうえお表からえらんでね</p>
+                        </div>
+
+                        <div class="bg-white border border-slate-100 p-5 rounded-3xl shadow-sm flex flex-col items-center mb-6">
+                            <div class="w-40 h-40 bg-slate-50 border-2 border-slate-200 rounded-2xl overflow-hidden shadow-inner mb-4">
+                                <img src="${drawing.image}" class="w-full h-full object-cover">
+                            </div>
+
+                            <div class="flex items-center justify-center mb-1.5 min-h-[32px]">
+                                ${maskString}${placeholderString}
+                            </div>
+                            <div class="text-[10px] text-slate-400 font-bold mb-4">
+                                (${currentInputName.length}もじ)
+                            </div>
+
+                            <div class="w-full max-w-sm text-center py-2.5 px-4 bg-slate-50 rounded-2xl border border-slate-200/60 min-h-[48px] flex items-center justify-center gap-1 flex-wrap">
+                                ${currentInputName ? `
+                                    <span class="text-2xl font-black text-indigo-700 tracking-wider">${currentInputName}</span>
+                                ` : `
+                                    <span class="text-slate-400 text-sm font-bold">あいうえお表からえらんでね</span>
+                                `}
+                            </div>
+                        </div>
+
+                        <div id="keyboard-container" class="bg-white p-4 rounded-3xl border border-slate-100 shadow-sm max-w-md mx-auto"></div>
+                    </div>
+
+                    <div class="mt-8 flex justify-center gap-3 w-full max-w-md mx-auto">
+                        <button onclick="window.deleteLastChar()" 
+                            class="bg-slate-200 hover:bg-slate-300 active:bg-slate-400 text-slate-700 font-extrabold px-6 py-4 rounded-2xl transition-all flex items-center gap-2">
+                            <i class="fa-solid fa-delete-left"></i>
+                            <span>1文字消す</span>
+                        </button>
+                        
+                        <button onclick="window.confirmNameInput()" 
+                            class="flex-1 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white font-black py-4 px-8 rounded-2xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 flex items-center justify-center gap-2">
+                            <span>これにきめた！</span>
+                            <i class="fa-solid fa-check"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        } else if (state.screen === 'result') {
+            const checkResult = checkShiritoriResults(state.drawings, state.startChar, state.endChar);
+            const isAllRevealed = revealStep >= 11;
+
+            mainContent = `
+                <div class="max-w-4xl mx-auto px-4 py-8 flex-1 flex flex-col justify-between">
+                    <div class="text-center mb-8">
+                        <span class="text-xs font-black text-indigo-500 tracking-widest uppercase bg-indigo-50 px-3 py-1 rounded-full border border-indigo-100">
+                            チャレンジけっか
+                        </span>
+                        <h2 class="text-3xl font-black text-slate-800 mt-2">
+                            絵しりとり 12枚の答え合わせ
+                        </h2>
+                        <p class="text-xs text-slate-400 font-bold mt-1">1枚ずつ描いた絵の答えをひらいていくよ！</p>
+                    </div>
+
+                    <div class="flex justify-center gap-2 mb-8 bg-white p-4 rounded-3xl border border-slate-100 shadow-sm max-w-lg mx-auto w-full sticky top-4 z-40">
+                        ${!isAllRevealed ? `
+                            <button id="reveal-next-btn" onclick="window.revealNext()" 
+                                class="flex-1 bg-yellow-400 hover:bg-yellow-500 text-yellow-950 font-black py-3 px-5 rounded-2xl shadow-md transition-all active:scale-95 text-sm flex items-center justify-center gap-2">
+                                <i class="fa-solid fa-eye"></i>
+                                <span>次の絵の答えをひらく (${revealStep + 2}/12)</span>
+                            </button>
+                            <button onclick="window.revealAll()" 
+                                class="bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-3 px-4 rounded-2xl text-sm transition-all active:scale-95">
+                                一気に全部ひらく
+                            </button>
+                        ` : `
+                            <div class="text-center w-full">
+                                <div class="font-black text-xl mb-1.5 ${checkResult.isSuccess ? 'text-emerald-600 animate-bounce' : 'text-rose-500'}">
+                                    ${checkResult.isSuccess ? '🎉 チャレンジ成功！！全部つながったよ！' : '😢 チャレンジ失敗... つながらなかったよ'}
+                                </div>
+                                <button onclick="window.goBackToTop()" 
+                                    class="bg-indigo-600 hover:bg-indigo-700 text-white font-black py-2.5 px-6 rounded-2xl shadow transition-all active:scale-95 text-xs inline-flex items-center gap-2">
+                                    <i class="fa-solid fa-circle-left"></i>
+                                    <span>トップにもどる (自動保存済)</span>
+                                </button>
+                            </div>
+                        `}
+                    </div>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 mb-12">
+                        ${state.drawings.map((draw, index) => {
+                            const isRevealed = index <= revealStep;
+                            const resultDetail = checkResult.details[index];
+                            
+                            let mask = '';
+                            if (!isRevealed) {
+                                for(let i=0; i < draw.name.length; i++) {
+                                    mask += '●';
+                                }
+                            }
+
+                            const startLabel = index === 0 ? state.startChar : drawingsStartChar(index);
+
+                            return `
+                                <div id="result-card-${index}" 
+                                    class="bg-white border-2 rounded-3xl overflow-hidden p-4 shadow-sm flex flex-col justify-between transition-all duration-300 relative
+                                    ${isRevealed ? (resultDetail.isOk ? 'border-emerald-200 bg-emerald-50/10' : 'border-rose-200 bg-rose-50/10') : 'border-slate-100'}">
+                                    
+                                    ${isRevealed ? `
+                                        <div class="absolute top-2 right-2 z-10 w-8 h-8 rounded-full flex items-center justify-center text-lg font-black shadow-md
+                                            ${resultDetail.isOk ? 'bg-emerald-500 text-white' : 'bg-rose-500 text-white'}">
+                                            ${resultDetail.isOk ? '<i class="fa-solid fa-circle-check"></i>' : '<i class="fa-solid fa-circle-xmark"></i>'}
+                                        </div>
+                                    ` : ''}
+
+                                    <div class="mb-2 flex items-center justify-between">
+                                        <span class="bg-indigo-50 text-indigo-700 text-[10px] font-black px-2 py-0.5 rounded-full">
+                                            ${index + 1}枚目
+                                        </span>
+                                        <span class="text-[10px] text-slate-400 font-bold">
+                                            お題頭文字:「${startLabel}」
+                                        </span>
+                                    </div>
+
+                                    <div class="aspect-square bg-slate-50 border border-slate-100 rounded-2xl overflow-hidden mb-3.5 relative">
+                                        <img src="${draw.image}" class="w-full h-full object-cover">
+                                    </div>
+
+                                    <div class="text-center">
+                                        ${isRevealed ? `
+                                            <div class="text-lg font-extrabold text-slate-800 leading-tight">
+                                                ${draw.name}
+                                            </div>
+                                            <div class="mt-2 text-[10px] text-slate-400 font-bold flex justify-center gap-1.5 items-center bg-slate-50 py-1 rounded-xl border border-slate-100">
+                                                <span>頭:「${draw.name.charAt(0)}」</span>
+                                                <i class="fa-solid fa-arrow-right text-[8px] text-slate-300"></i>
+                                                <span>尾:「${draw.name.charAt(draw.name.length - 1)}」</span>
+                                            </div>
+                                            ${!resultDetail.isOk ? `
+                                                <div class="text-[9px] text-rose-500 font-black mt-1 bg-rose-50 p-1 rounded-lg border border-rose-100">
+                                                    ${resultDetail.reason}
+                                                </div>
+                                            ` : ''}
+                                        ` : `
+                                            <div class="text-lg font-black tracking-widest text-slate-400 flex flex-col items-center">
+                                                <span class="text-xs text-slate-400 font-bold mb-1">なまえの文字数</span>
+                                                <div class="bg-slate-100 text-slate-700 rounded-full px-3 py-0.5 text-xs font-black select-none tracking-wide">
+                                                    ${mask}
+                                                </div>
+                                                <span class="text-[10px] text-slate-300 mt-1">(${draw.name.length}文字)</span>
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+
+                    <div class="bg-white border border-slate-100 p-5 rounded-3xl shadow-sm text-center max-w-md mx-auto w-full">
+                        <span class="text-xs font-black text-slate-400">おさらい</span>
+                        <div class="mt-1 text-sm font-extrabold text-slate-600 flex justify-center items-center gap-2">
+                            <span>最初の文字: <span class="text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-lg border border-indigo-100 font-black">${state.startChar}</span></span>
+                            <i class="fa-solid fa-arrow-right text-xs text-slate-300"></i>
+                            <span>指定最後の文字: <span class="text-pink-600 bg-pink-50 px-2 py-0.5 rounded-lg border border-pink-100 font-black">${state.endChar}</span></span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        root.innerHTML = headerHtml + `<main class="flex-1 flex flex-col">${mainContent}</main>`;
+
+        if (state.screen === 'game') {
+            initCanvas();
+            renderColorPalette();
+            renderWidthPalette();
+        } else if (state.screen === 'input') {
+            renderKeyboard();
+        }
+
+        renderDetailModal();
+    }
+
+    // アーカイブ詳細モーダル
+    function renderDetailModal() {
+        const modalContainerId = 'detail-modal-container';
+        let container = document.getElementById(modalContainerId);
+        
+        if (!container) {
+            container = document.createElement('div');
+            container.id = modalContainerId;
+            document.body.appendChild(container);
+        }
+
+        if (!state.selectedArchive) {
+            container.innerHTML = '';
+            return;
+        }
+
+        const arch = state.selectedArchive;
+        
+        container.innerHTML = `
+            <div class="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+                <div class="bg-white rounded-3xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden transition-all transform scale-100">
+                    <div class="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                        <div>
+                            <span class="text-xs font-bold text-slate-400">${arch.createdAtString}</span>
+                            <h3 class="text-lg font-black text-slate-800 flex items-center gap-2">
+                                <span>しりとりアーカイブ</span>
+                                <span class="px-2.5 py-0.5 rounded-full text-xs font-black ${arch.isSuccess ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">
+                                    ${arch.isSuccess ? '成功' : '失敗'}
+                                </span>
+                            </h3>
+                        </div>
+                        <button onclick="window.closeArchiveDetail()" class="text-slate-400 hover:text-slate-600 text-xl p-2 rounded-full hover:bg-slate-200 transition-colors">
+                            <i class="fa-solid fa-xmark"></i>
+                        </button>
+                    </div>
+
+                    <div class="p-6 overflow-y-auto flex-1 bg-slate-50/50">
+                        <div class="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex flex-wrap justify-around items-center gap-3 mb-6 text-center">
+                            <div class="flex items-center gap-1 text-slate-600 font-extrabold text-sm">
+                                <span>最初の文字: </span>
+                                <span class="bg-indigo-50 text-indigo-700 w-7 h-7 rounded-lg flex items-center justify-center text-sm font-black border border-indigo-100">${arch.startChar}</span>
+                            </div>
+                            <i class="fa-solid fa-arrow-right text-slate-300"></i>
+                            <div class="flex items-center gap-1 text-slate-600 font-extrabold text-sm">
+                                <span>最後の指定文字: </span>
+                                <span class="bg-pink-50 text-pink-700 w-7 h-7 rounded-lg flex items-center justify-center text-sm font-black border border-pink-100">${arch.endChar}</span>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                            ${arch.drawings.map((draw, index) => {
+                                const detail = arch.details[index];
+                                return `
+                                    <div class="bg-white border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between">
+                                        <div class="flex justify-between items-center mb-2">
+                                            <span class="bg-slate-100 text-slate-600 text-[10px] font-black px-2 py-0.5 rounded-full">
+                                                ${index + 1}枚目
+                                            </span>
+                                            <span class="text-xs font-black ${detail.isOk ? 'text-emerald-500' : 'text-rose-500'}">
+                                                ${detail.isOk ? '◯ つながりOK' : '❌ エラー'}
+                                            </span>
+                                        </div>
+
+                                        <div class="aspect-square bg-slate-50 border border-slate-100 rounded-xl overflow-hidden mb-2 relative">
+                                            <img src="${draw.image}" onerror="this.src='https://placehold.co/200x200?text=NoImage'" class="w-full h-full object-cover">
+                                        </div>
+
+                                        <div class="text-center">
+                                            <div class="text-base font-extrabold text-slate-800">${draw.name}</div>
+                                            <div class="text-[9px] text-slate-400 font-bold mt-1 bg-slate-50 py-0.5 rounded-md flex justify-center gap-1">
+                                                <span>頭:「${draw.name.charAt(0)}」</span>
+                                                <span>尾:「${draw.name.charAt(draw.name.length - 1)}」</span>
+                                            </div>
+                                            ${!detail.isOk ? `
+                                                <div class="text-[9px] text-rose-500 font-black mt-1.5 bg-rose-50 p-1 rounded border border-rose-100 leading-tight">
+                                                    ${detail.reason}
+                                                </div>
+                                            ` : ''}
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+
+                    <div class="p-4 border-t border-slate-100 flex justify-end bg-slate-50">
+                        <button onclick="window.closeArchiveDetail()" class="bg-slate-700 hover:bg-slate-800 text-white font-extrabold py-2 px-6 rounded-xl text-sm transition-colors">
+                            とじる
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+</script>
+
+<div id="app-root" class="flex-1 flex flex-col">
+    <!-- ローディングのプレースホルダー -->
+    <div class="flex-1 flex flex-col items-center justify-center p-8 text-center bg-[#fefcf0]">
+        <div class="w-16 h-16 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+        <p class="text-lg font-bold text-slate-600">アプリケーションの準備中...</p>
+    </div>
+</div>
+
+<!-- フッター -->
+<footer class="bg-slate-900 text-slate-400 py-6 text-center text-xs font-bold border-t border-slate-800">
+    <div class="max-w-4xl mx-auto px-4 space-y-2">
+        <p class="text-slate-500">
+            お絵かきしりとりゲーム ｜ 12文字をひらめきで繋ごう！
+        </p>
+        <p>© 2026 E-Shiritori Challenge. All rights reserved.</p>
+    </div>
+</footer>
+
+</body>
+</html>
