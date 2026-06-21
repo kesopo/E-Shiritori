@@ -38,6 +38,14 @@
         canvas {
             touch-action: none;
         }
+        /* ポップなゆらゆら・ふわふわアニメーション */
+        @keyframes bounce-subtle {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-4px); }
+        }
+        .animate-bounce-subtle {
+            animation: bounce-subtle 2s infinite ease-in-out;
+        }
     </style>
 </head>
 <body class="min-h-screen text-slate-800 flex flex-col justify-between">
@@ -99,7 +107,9 @@
         archives: [], // 過去のゲーム履歴
         selectedArchive: null, // 詳細表示用
         isConfirmingDelete: false, // 削除確認中フラグ
-        isSyncing: false // データベース同期中のフラグ
+        isSyncing: false, // データベース同期中のフラグ
+        isConfirmingQuit: false, // 中断確認ダイアログの表示フラグ
+        zoomedImage: null // 拡大表示中のオブジェクト { image: dataUrl, stepIndex: number, textLength: number, name?: string }
     };
 
     // モジュール外（HTMLのonclick属性等）からstateに安全にアクセスできるようグローバルに露出
@@ -141,7 +151,6 @@
         render(); // ローディング表示に切り替え
         
         try {
-            // RULE 1: Strict Paths
             const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives');
             const querySnapshot = await getDocs(colRef);
             const fbArchives = [];
@@ -150,7 +159,7 @@
                 fbArchives.push({ id: doc.id, ...doc.data() });
             });
             
-            // 日付が新しい順にソート（RULE 2: メモリ上でソート）
+            // 日付が新しい順にソート
             fbArchives.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
             
             state.archives = fbArchives;
@@ -173,7 +182,6 @@
                 db = getFirestore(app);
                 auth = getAuth(app);
                 
-                // 認証リスナーの設定（認証完了後に読み込みをキックする）
                 onAuthStateChanged(auth, async (u) => {
                     if (u) {
                         user = u;
@@ -185,7 +193,6 @@
                     }
                 });
 
-                // ログイン処理を開始 (RULE 3: Auth Before Queries)
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                     await signInWithCustomToken(auth, __initial_auth_token);
                 } else {
@@ -201,7 +208,6 @@
         }
     }
 
-    // 読み込み時初期化
     window.onload = function() {
         initLocalCache(); // まず手元のキャッシュを読み込んで仮表示
         render();
@@ -218,7 +224,6 @@
             try {
                 const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives');
                 await addDoc(colRef, archiveData);
-                // 最新の状態に同期する
                 await loadArchives();
             } catch (error) {
                 console.error("Error saving to Firestore:", error);
@@ -229,14 +234,12 @@
     // ひらがなの清音化・標準化（しりとり判定用）
     function normalizeChar(char) {
         if (!char) return '';
-        // 小文字を大文字に変換
         const map = {
             'ぁ': 'あ', 'ぃ': 'い', 'ぅ': 'う', 'ぇ': 'え', 'ぉ': 'お',
             'っ': 'つ', 'ゃ': 'や', 'ゅ': 'ゆ', 'ょ': 'よ', 'ゎ': 'わ'
         };
         let normalized = map[char] || char;
         
-        // 濁音・半濁音を清音にする
         const dakuonMap = {
             'が': 'か', 'ぎ': 'き', 'ぐ': 'く', 'げ': 'け', 'ご': 'こ',
             'ざ': 'さ', 'じ': 'し', 'ず': 'す', 'ぜ': 'せ', 'ぞ': 'そ',
@@ -318,7 +321,7 @@
         };
     }
 
-    // ゲーム遷移・ゲームロジック
+    // 新しいゲームを開始する
     function startNewGame() {
         const startIdx = Math.floor(Math.random() * HIRAGANA_POOL.length);
         let endIdx = Math.floor(Math.random() * HIRAGANA_POOL.length);
@@ -331,9 +334,36 @@
         state.startChar = HIRAGANA_POOL[startIdx];
         state.endChar = HIRAGANA_POOL[endIdx];
         state.drawings = [];
+        state.isConfirmingQuit = false;
+        state.zoomedImage = null;
         
         render();
         initCanvas();
+    }
+
+    // 中断手続き
+    function setConfirmQuit(val) {
+        state.isConfirmingQuit = val;
+        render();
+    }
+
+    function quitGameConfirmed() {
+        state.screen = 'top';
+        state.isConfirmingQuit = false;
+        state.drawings = [];
+        render();
+        loadArchives();
+    }
+
+    // 拡大（ズーム）機能
+    function showZoomImage(image, stepIndex, textLength, name = '') {
+        state.zoomedImage = { image, stepIndex, textLength, name };
+        render();
+    }
+
+    function closeZoomImage() {
+        state.zoomedImage = null;
+        render();
     }
 
     function goToInputScreen() {
@@ -395,7 +425,6 @@
         state.screen = 'result';
         
         const checkResult = checkShiritoriResults(state.drawings, state.startChar, state.endChar);
-        
         const now = new Date();
         const dateString = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
@@ -444,13 +473,12 @@
     function goBackToTop() {
         state.screen = 'top';
         render();
-        // トップに戻る際に最新状態への同期も行う
         loadArchives();
     }
 
     function openArchiveDetail(index) {
         state.selectedArchive = state.archives[index];
-        state.isConfirmingDelete = false; // モーダルを開くときは確認フラグをリセット
+        state.isConfirmingDelete = false;
         render();
     }
 
@@ -460,7 +488,6 @@
         render();
     }
 
-    // アーカイブ削除処理（LocalStorageとFirestoreから削除）
     async function deleteArchive() {
         if (!state.selectedArchive) return;
         
@@ -469,17 +496,13 @@
         
         try {
             const targetId = state.selectedArchive.id;
-            
-            // 1. メモリとLocalStorageから削除
             state.archives = state.archives.filter(arch => arch.id !== targetId);
             localStorage.setItem('shiritori_archives_local', JSON.stringify(state.archives));
             
-            // 2. Firebase Firestoreから削除
             if (db && user && targetId) {
                 const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives', targetId);
                 await deleteDoc(docRef);
             }
-            
             showToast('アーカイブをさくじょしました！');
         } catch (error) {
             console.error("Error deleting archive:", error);
@@ -489,7 +512,7 @@
             state.isConfirmingDelete = false;
             state.isSyncing = false;
             render();
-            loadArchives(); // 最新状態に完全同期
+            loadArchives();
         }
     }
 
@@ -689,6 +712,10 @@
     window.undoDraw = undoDraw;
     window.clearCanvas = clearCanvas;
     window.startNewGame = startNewGame;
+    window.setConfirmQuit = setConfirmQuit;
+    window.quitGameConfirmed = quitGameConfirmed;
+    window.showZoomImage = showZoomImage;
+    window.closeZoomImage = closeZoomImage;
     window.goToInputScreen = goToInputScreen;
     window.handleNameInput = handleNameInput;
     window.deleteLastChar = deleteLastChar;
@@ -763,17 +790,17 @@
         container.innerHTML = tabHtml + keysHtml;
     }
 
-    // ロードマップコンポーネント
+    // ロードマップコンポーネント（画像をタップすると拡大モーダルが表示される仕組み）
     function getRoadmapHtml() {
         let html = `
-            <div class="w-full bg-white p-3.5 rounded-2xl border border-slate-200/70 shadow-sm mb-5">
+            <div class="w-full bg-white p-3.5 rounded-2xl border border-slate-200/70 shadow-sm mb-4">
                 <div class="flex items-center justify-between mb-2">
                     <span class="text-xs font-black text-slate-500 flex items-center gap-1">
-                        <i class="fa-solid fa-map"></i>
-                        <span>12枚のえしりとりロードマップ</span>
+                        <i class="fa-solid fa-map text-indigo-500"></i>
+                        <span>しりとりロードマップ (全12枚)</span>
                     </span>
-                    <span class="text-[10px] text-slate-400 font-bold">
-                        (お絵かき中も常に見れます)
+                    <span class="text-[10px] text-slate-400 font-bold bg-indigo-50 px-2 py-0.5 rounded-full">
+                        <i class="fa-solid fa-magnifying-glass-plus"></i> 絵をタップで拡大
                     </span>
                 </div>
                 <div class="grid grid-cols-6 sm:grid-cols-12 gap-1.5">
@@ -787,13 +814,16 @@
             
             let borderClass = 'border-slate-200 bg-slate-50';
             if (isCurrent) {
-                borderClass = 'border-indigo-500 ring-4 ring-indigo-100 bg-indigo-50/10';
+                borderClass = 'border-indigo-500 ring-4 ring-indigo-100 bg-indigo-50/10 scale-105 z-10';
             } else if (hasDrawing) {
-                borderClass = 'border-emerald-300 bg-emerald-50/5';
+                borderClass = 'border-emerald-200 bg-emerald-50/10 cursor-pointer hover:scale-105 transition-transform';
             }
 
+            // タップ時の処理
+            const clickAction = hasDrawing ? `onclick="window.showZoomImage('${drawing.image}', ${i}, ${drawing.name.length})"` : '';
+
             html += `
-                <div class="aspect-square border rounded-xl flex flex-col justify-between p-1 relative overflow-hidden text-[9px] transition-all ${borderClass}">
+                <div ${clickAction} class="aspect-square border rounded-xl flex flex-col justify-between p-1 relative overflow-hidden text-[9px] transition-all ${borderClass}">
                     <div class="flex justify-between items-center leading-none text-slate-400 font-extrabold mb-0.5">
                         <span class="${isCurrent ? 'text-indigo-600 font-black' : ''}">${i + 1}</span>
                         ${i === 0 ? `<span class="bg-indigo-500 text-white rounded px-0.5 text-[8px] transform scale-90 origin-right">始:${state.startChar}</span>` : ''}
@@ -802,7 +832,7 @@
                     
                     <div class="flex-1 flex items-center justify-center min-h-0 relative">
                         ${hasDrawing ? `
-                            <img src="${drawing.image}" class="w-full h-full object-cover rounded-md bg-white">
+                            <img src="${drawing.image}" class="w-full h-full object-cover rounded bg-white">
                         ` : `
                             <span class="text-slate-300 text-[10px] font-bold"><i class="fa-solid fa-question"></i></span>
                         `}
@@ -835,14 +865,14 @@
         if (state.screen !== 'top') {
             headerHtml = `
                 <header class="bg-white border-b border-slate-100 py-3 px-4 flex justify-between items-center shadow-sm">
-                    <button onclick="window.goBackToTop()" class="flex items-center gap-1 text-slate-500 hover:text-indigo-600 font-bold text-sm transition-all">
-                        <i class="fa-solid fa-house"></i>
-                        <span>トップに戻る</span>
+                    <button onclick="window.setConfirmQuit(true)" class="flex items-center gap-1.5 text-slate-400 hover:text-rose-500 font-bold text-xs md:text-sm bg-slate-50 hover:bg-rose-50 py-1.5 px-3 rounded-full border border-slate-100 transition-all">
+                        <i class="fa-solid fa-circle-xmark"></i>
+                        <span>ちゅうだんする</span>
                     </button>
-                    <div class="flex items-center gap-2">
+                    <div class="flex items-center gap-1.5">
                         <span class="bg-yellow-100 text-yellow-800 text-xs px-2.5 py-1 rounded-full font-extrabold flex items-center gap-1">
-                            <i class="fa-solid fa-palette"></i>
-                            しりとり 12枚チャレンジ
+                            <i class="fa-solid fa-palette animate-spin" style="animation-duration: 3s;"></i>
+                            チャレンジ中
                         </span>
                     </div>
                 </header>
@@ -855,13 +885,13 @@
             mainContent = `
                 <div class="max-w-4xl mx-auto px-4 py-8 flex flex-col items-center justify-center flex-1">
                     <div class="text-center mb-10 max-w-lg">
-                        <div class="inline-flex p-4 bg-yellow-100 text-yellow-600 rounded-3xl mb-4 text-5xl animate-bounce">
+                        <div class="inline-flex p-4 bg-yellow-100 text-yellow-600 rounded-3xl mb-4 text-5xl animate-bounce-subtle shadow-md">
                             <i class="fa-solid fa-paint-brush"></i>
                         </div>
-                        <h1 class="text-4xl md:text-5xl font-black text-indigo-900 tracking-wider mb-3">
+                        <h1 class="text-4xl md:text-5xl font-black text-indigo-950 tracking-wider mb-3">
                             絵しりとり<span class="text-yellow-500">ギャラリー</span>
                         </h1>
-                        <p class="text-sm text-slate-500 font-bold tracking-wide">
+                        <p class="text-xs md:text-sm text-slate-500 font-bold tracking-wide">
                             お絵描きで繋ぐ12枚の連想絵しりとり！
                         </p>
                     </div>
@@ -885,47 +915,46 @@
                                 <i class="fa-solid fa-images"></i>
                             </div>
                             <div>
-                                <h3 class="text-2xl font-black text-slate-800 mb-2">これまでの絵画録</h3>
+                                <h3 class="text-2xl font-black text-slate-800 mb-2">これまでの作品</h3>
                                 <p class="text-slate-500 text-sm">過去に描きあげた絵しりとりのアーカイブを鑑賞します。</p>
                             </div>
                         </button>
                     </div>
 
-                    <!-- ルール説明 -->
-                    <div class="bg-white border-2 border-indigo-50/50 p-6 rounded-3xl shadow-sm w-full max-w-2xl mb-12">
-                        <h4 class="text-indigo-900 font-extrabold mb-4 flex items-center gap-2 border-b pb-2">
+                    <!-- ルール説明（グラフィカル版） -->
+                    <div class="bg-white border border-slate-200 p-6 rounded-3xl shadow-sm w-full max-w-2xl mb-12">
+                        <h4 class="text-indigo-950 font-black text-base mb-5 flex items-center gap-2 pb-2 border-b">
                             <i class="fa-solid fa-circle-info text-yellow-500"></i>
-                            あそびかたルール
+                            ゲームの流れ
                         </h4>
-                        <ul class="text-slate-600 text-sm font-bold space-y-2.5">
-                            <li class="flex items-start gap-2">
-                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">1</span>
-                                <span>最初はランダムな「最初のお題（頭文字）」からはじまる絵を描きます。</span>
-                            </li>
-                            <li class="flex items-start gap-2">
-                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">2</span>
-                                <span>描き終わったら、その絵の名前をあいうえお表（横向き五十音図）から入力します。</span>
-                            </li>
-                            <li class="flex items-start gap-2">
-                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">3</span>
-                                <span>次の人は、前の人の「絵」と「●の文字数」だけを見て、何を描いたか推理してしりとりを繋ぎます。</span>
-                            </li>
-                            <li class="flex items-start gap-2">
-                                <span class="bg-yellow-400 text-yellow-950 font-black rounded-full w-5 h-5 flex items-center justify-center text-xs flex-shrink-0 mt-0.5">4</span>
-                                <span>最後の12枚目は、指定された「最後の文字」で綺麗に終わるように絵を描く必要があります。</span>
-                            </li>
-                        </ul>
+                        <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 text-center">
+                            <div class="flex flex-col items-center">
+                                <div class="w-10 h-10 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center font-black text-sm mb-2">1</div>
+                                <span class="text-xs font-black text-slate-700">お題の絵を描く</span>
+                            </div>
+                            <div class="flex flex-col items-center">
+                                <div class="w-10 h-10 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center font-black text-sm mb-2">2</div>
+                                <span class="text-xs font-black text-slate-700">ひらがな入力</span>
+                            </div>
+                            <div class="flex flex-col items-center">
+                                <div class="w-10 h-10 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center font-black text-sm mb-2">3</div>
+                                <span class="text-xs font-black text-slate-700">絵を見て推理・接続</span>
+                            </div>
+                            <div class="flex flex-col items-center">
+                                <div class="w-10 h-10 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center font-black text-sm mb-2">4</div>
+                                <span class="text-xs font-black text-slate-700">12枚でゴール！</span>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- アーカイブセクション -->
-                    <div id="archives-section" class="w-full max-w-4xl border-t border-slate-200/60 pt-10">
+                    <div id="archives-section" class="w-full max-w-4xl border-t border-slate-200 pt-10">
                         <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-6">
                             <h2 class="text-2xl font-black text-slate-800 flex items-center gap-2">
                                 <i class="fa-solid fa-bookmark text-indigo-500"></i>
                                 あーかいぶ (${state.archives.length}件)
                             </h2>
                             
-                            <!-- 同期/手動更新ボタン -->
                             <div class="flex items-center gap-2 w-full sm:w-auto">
                                 ${state.isSyncing ? `
                                     <span class="text-xs text-indigo-600 font-bold bg-indigo-50 px-3 py-1.5 rounded-full flex items-center gap-1.5 shadow-sm border border-indigo-100 animate-pulse">
@@ -990,46 +1019,62 @@
             `;
         } else if (state.screen === 'game') {
             const isLast = state.currentStep === 11;
-            
+            const prevDrawing = state.currentStep > 0 ? state.drawings[state.currentStep - 1] : null;
+
             mainContent = `
                 <div class="max-w-2xl mx-auto px-4 py-6 flex-1 flex flex-col justify-between">
                     <div>
                         ${getRoadmapHtml()}
 
-                        <div class="flex items-center justify-between mb-4 bg-slate-100 rounded-2xl p-2.5">
-                            <span class="text-xs font-black text-slate-500">えのステップ</span>
-                            <span class="text-base font-black text-indigo-600">
-                                ${state.currentStep + 1} <span class="text-slate-400 text-xs">/ 12 枚目</span>
-                            </span>
-                            <div class="w-24 bg-slate-200 h-2 rounded-full overflow-hidden">
-                                <div class="bg-indigo-600 h-full transition-all" style="width: ${((state.currentStep + 1) / 12) * 100}%"></div>
-                            </div>
-                        </div>
-
-                        <div class="bg-white border-2 border-dashed border-indigo-200 rounded-3xl p-5 text-center mb-6 shadow-sm">
+                        <!-- ビジュアルガイダンス (スッキリUI) -->
+                        <div class="bg-white border border-slate-200 rounded-3xl p-4 text-center mb-6 shadow-sm flex flex-col items-center justify-center gap-2">
                             ${state.currentStep === 0 ? `
-                                <h2 class="text-lg md:text-xl font-black text-slate-700">
-                                    最初のお題「<span class="text-3xl text-indigo-600 font-black inline-block bg-indigo-50 px-3 py-1 rounded-2xl border border-indigo-200 mx-1">${state.startChar}</span>」からはじまる絵を描こう！
-                                </h2>
-                            ` : isLast ? `
-                                <div class="text-xs text-rose-500 font-black mb-1 flex items-center justify-center gap-1">
-                                    <i class="fa-solid fa-triangle-exclamation animate-pulse"></i>
-                                    ラストお絵かき！
+                                <div class="flex items-center gap-2 bg-indigo-50 border border-indigo-100 px-4 py-2 rounded-2xl">
+                                    <span class="text-xs font-black text-indigo-500">1枚目のお題</span>
+                                    <span class="text-3xl text-indigo-600 font-black">「${state.startChar}」</span>
                                 </div>
-                                <h2 class="text-lg md:text-xl font-black text-slate-700 leading-relaxed">
-                                    前の人の絵を見てしりとりを繋ぎ、<br class="md:hidden">
-                                    最後が「<span class="text-3xl text-pink-600 font-black inline-block bg-pink-50 px-2.5 py-0.5 rounded-xl border border-pink-200 mx-1">${state.endChar}</span>」で終わる絵を描こう！
-                                </h2>
+                                <h2 class="text-base font-black text-slate-700">から始まる絵を描こう！</h2>
+                            ` : isLast ? `
+                                <div class="flex items-center gap-2 bg-pink-50 border border-pink-100 px-4 py-2 rounded-2xl animate-pulse">
+                                    <span class="text-xs font-black text-pink-500">最後のお題</span>
+                                    <span class="text-3xl text-pink-600 font-black">「${state.endChar}」</span>
+                                </div>
+                                <h2 class="text-base font-black text-slate-700">で終わるよう絵を描こう！</h2>
                             ` : `
-                                <h2 class="text-lg md:text-xl font-black text-slate-700">
-                                    前の人の絵と「●の数」から推理して、しりとりが繋がる絵を自由に描こう！
-                                </h2>
-                                <p class="text-xs text-slate-400 font-bold mt-1.5">※次の文字（頭文字）のヒントはありません。自分の目で絵を解釈して繋げよう！</p>
+                                <div class="flex flex-col items-center gap-1.5 w-full">
+                                    <span class="text-xs font-black text-amber-600 bg-amber-50 border border-amber-100 px-3 py-1 rounded-full flex items-center gap-1">
+                                        <i class="fa-solid fa-lightbulb"></i> 前の人の絵をみて推理しよう！
+                                    </span>
+                                    <div class="flex items-center justify-center gap-3 mt-1.5">
+                                        <!-- 直前の絵をクイック表示 -->
+                                        ${prevDrawing ? `
+                                            <div onclick="window.showZoomImage('${prevDrawing.image}', ${state.currentStep - 1}, ${prevDrawing.name.length})" 
+                                                class="w-14 h-14 rounded-xl overflow-hidden border-2 border-slate-300 shadow cursor-pointer active:scale-95 transition-all relative group flex-shrink-0 bg-white">
+                                                <img src="${prevDrawing.image}" class="w-full h-full object-cover">
+                                                <div class="absolute inset-0 bg-black/40 flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition-opacity">
+                                                    <i class="fa-solid fa-search-plus text-xs"></i>
+                                                </div>
+                                            </div>
+                                            <div class="text-left">
+                                                <div class="text-[10px] text-slate-400 font-bold">前の絵のなまえ</div>
+                                                <div class="flex gap-1 items-center mt-0.5">
+                                                    ${Array.from({ length: prevDrawing.name.length }).map(() => `
+                                                        <span class="w-3.5 h-3.5 rounded-full bg-slate-700 inline-block text-white text-[8px] text-center leading-3.5">●</span>
+                                                    `).join('')}
+                                                    <span class="text-[10px] text-slate-400 ml-1">(${prevDrawing.name.length}もじ)</span>
+                                                </div>
+                                                <span class="text-[9px] text-indigo-500 font-black cursor-pointer hover:underline" onclick="window.showZoomImage('${prevDrawing.image}', ${state.currentStep - 1}, ${prevDrawing.name.length})">
+                                                    タップして大きくみる <i class="fa-solid fa-search-plus text-[8px]"></i>
+                                                </span>
+                                            </div>
+                                        ` : ''}
+                                    </div>
+                                </div>
                             `}
                         </div>
 
                         <div class="flex flex-col items-center">
-                            <div class="w-full aspect-square max-w-[420px] bg-white border-4 border-slate-700/85 rounded-3xl shadow-lg overflow-hidden relative">
+                            <div class="w-full aspect-square max-w-[420px] bg-white border-4 border-slate-800 rounded-3xl shadow-lg overflow-hidden relative">
                                 <canvas id="paint-canvas" class="w-full h-full cursor-crosshair"></canvas>
                             </div>
 
@@ -1054,7 +1099,7 @@
                     <div class="mt-8 flex justify-center">
                         <button onclick="window.goToInputScreen()" 
                             class="w-full max-w-sm bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white font-black py-4 px-8 rounded-3xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 text-lg flex items-center justify-center gap-2">
-                            <span>かけおわった！おなまえ入力へ</span>
+                            <span>かけおわった！おなまえを入力する</span>
                             <i class="fa-solid fa-arrow-right"></i>
                         </button>
                     </div>
@@ -1079,12 +1124,13 @@
                         ${getRoadmapHtml()}
 
                         <div class="text-center mb-4">
-                            <h2 class="text-xl font-black text-slate-700">この絵のおなまえは何？</h2>
-                            <p class="text-xs text-slate-400 font-bold">ひらがなであいうえお表からえらんでね</p>
+                            <h2 class="text-lg font-black text-slate-700 flex items-center justify-center gap-1">
+                                <i class="fa-solid fa-keyboard text-indigo-500"></i> この絵のなまえは何？
+                            </h2>
                         </div>
 
-                        <div class="bg-white border border-slate-100 p-5 rounded-3xl shadow-sm flex flex-col items-center mb-6">
-                            <div class="w-40 h-40 bg-slate-50 border-2 border-slate-200 rounded-2xl overflow-hidden shadow-inner mb-4">
+                        <div class="bg-white border border-slate-200 p-5 rounded-3xl shadow-sm flex flex-col items-center mb-6">
+                            <div class="w-36 h-36 bg-slate-50 border border-slate-200 rounded-2xl overflow-hidden shadow-inner mb-4">
                                 <img src="${drawing.image}" class="w-full h-full object-cover">
                             </div>
 
@@ -1095,28 +1141,28 @@
                                 (${currentInputName.length}もじ)
                             </div>
 
-                            <div class="w-full max-w-sm text-center py-2.5 px-4 bg-slate-50 rounded-2xl border border-slate-200/60 min-h-[48px] flex items-center justify-center gap-1 flex-wrap">
+                            <div class="w-full max-w-sm text-center py-2.5 px-4 bg-slate-50 rounded-2xl border border-slate-200 min-h-[48px] flex items-center justify-center gap-1 flex-wrap">
                                 ${currentInputName ? `
                                     <span class="text-2xl font-black text-indigo-700 tracking-wider">${currentInputName}</span>
                                 ` : `
-                                    <span class="text-slate-400 text-sm font-bold">あいうえお表からえらんでね</span>
+                                    <span class="text-slate-400 text-xs font-bold">したの「あいうえお表」から入力してね</span>
                                 `}
                             </div>
                         </div>
 
-                        <div id="keyboard-container" class="bg-white p-4 rounded-3xl border border-slate-100 shadow-sm max-w-md mx-auto"></div>
+                        <div id="keyboard-container" class="bg-white p-4 rounded-3xl border border-slate-200 shadow-sm max-w-md mx-auto"></div>
                     </div>
 
                     <div class="mt-8 flex justify-center gap-3 w-full max-w-md mx-auto">
                         <button onclick="window.deleteLastChar()" 
-                            class="bg-slate-200 hover:bg-slate-300 active:bg-slate-400 text-slate-700 font-extrabold px-6 py-4 rounded-2xl transition-all flex items-center gap-2">
+                            class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-black px-6 py-4 rounded-2xl transition-all flex items-center gap-2 border border-slate-200">
                             <i class="fa-solid fa-delete-left"></i>
-                            <span>1文字消す</span>
+                            <span>けす</span>
                         </button>
                         
                         <button onclick="window.confirmNameInput()" 
                             class="flex-1 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white font-black py-4 px-8 rounded-2xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 flex items-center justify-center gap-2">
-                            <span>これにきめた！</span>
+                            <span>しりとりを繋ぐ！</span>
                             <i class="fa-solid fa-check"></i>
                         </button>
                     </div>
@@ -1135,7 +1181,6 @@
                         <h2 class="text-3xl font-black text-slate-800 mt-2">
                             絵しりとり 12枚の答え合わせ
                         </h2>
-                        <p class="text-xs text-slate-400 font-bold mt-1">1枚ずつ描いた絵の答えをひらいていくよ！</p>
                     </div>
 
                     <div class="flex justify-center gap-2 mb-8 bg-white p-4 rounded-3xl border border-slate-100 shadow-sm max-w-lg mx-auto w-full sticky top-4 z-40">
@@ -1143,21 +1188,21 @@
                             <button id="reveal-next-btn" onclick="window.revealNext()" 
                                 class="flex-1 bg-yellow-400 hover:bg-yellow-500 text-yellow-950 font-black py-3 px-5 rounded-2xl shadow-md transition-all active:scale-95 text-sm flex items-center justify-center gap-2">
                                 <i class="fa-solid fa-eye"></i>
-                                <span>次の絵の答えをひらく (${revealStep + 2}/12)</span>
+                                <span>次の絵をひらく (${revealStep + 2}/12)</span>
                             </button>
                             <button onclick="window.revealAll()" 
                                 class="bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-3 px-4 rounded-2xl text-sm transition-all active:scale-95">
-                                一気に全部ひらく
+                                すべて一気にひらく
                             </button>
                         ` : `
                             <div class="text-center w-full">
                                 <div class="font-black text-xl mb-1.5 ${checkResult.isSuccess ? 'text-emerald-600 animate-bounce' : 'text-rose-500'}">
-                                    ${checkResult.isSuccess ? '🎉 チャレンジ成功！！全部つながったよ！' : '😢 チャレンジ失敗... つながらなかったよ'}
+                                    ${checkResult.isSuccess ? '🎉 クリア成功！！全部つながったよ！' : '😢 つながらなかったよ...（失敗）'}
                                 </div>
                                 <button onclick="window.goBackToTop()" 
                                     class="bg-indigo-600 hover:bg-indigo-700 text-white font-black py-2.5 px-6 rounded-2xl shadow transition-all active:scale-95 text-xs inline-flex items-center gap-2">
                                     <i class="fa-solid fa-circle-left"></i>
-                                    <span>トップにもどる (自動保存済)</span>
+                                    <span>トップにもどる</span>
                                 </button>
                             </div>
                         `}
@@ -1255,6 +1300,101 @@
         }
 
         renderDetailModal();
+        renderQuitConfirmModal();
+        renderZoomModal();
+    }
+
+    // 中断確認モーダル
+    function renderQuitConfirmModal() {
+        const modalId = 'quit-confirm-container';
+        let container = document.getElementById(modalId);
+        
+        if (!container) {
+            container = document.createElement('div');
+            container.id = modalId;
+            document.body.appendChild(container);
+        }
+
+        if (!state.isConfirmingQuit) {
+            container.innerHTML = '';
+            return;
+        }
+
+        container.innerHTML = `
+            <div class="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+                <div class="bg-white rounded-3xl p-6 shadow-2xl max-w-xs w-full text-center border-4 border-yellow-200">
+                    <div class="w-12 h-12 rounded-full bg-rose-50 text-rose-500 flex items-center justify-center mx-auto text-2xl mb-3">
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+                    </div>
+                    <h3 class="text-lg font-black text-slate-800 mb-1">ゲームをやめる？</h3>
+                    <p class="text-xs text-slate-400 font-bold mb-5">これまでの絵はきえてしまいます。</p>
+                    <div class="flex flex-col gap-2">
+                        <button onclick="window.quitGameConfirmed()" 
+                            class="w-full bg-rose-500 hover:bg-rose-600 text-white font-black py-2.5 rounded-2xl text-sm transition-all active:scale-95">
+                            ゲームをやめる (トップへ)
+                        </button>
+                        <button onclick="window.setConfirmQuit(false)" 
+                            class="w-full bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-2.5 rounded-2xl text-xs transition-all">
+                            お絵描きをつづける
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    // ズームモーダル
+    function renderZoomModal() {
+        const modalId = 'zoom-modal-container';
+        let container = document.getElementById(modalId);
+        
+        if (!container) {
+            container = document.createElement('div');
+            container.id = modalId;
+            document.body.appendChild(container);
+        }
+
+        if (!state.zoomedImage) {
+            container.innerHTML = '';
+            return;
+        }
+
+        const z = state.zoomedImage;
+        container.innerHTML = `
+            <div onclick="window.closeZoomImage()" class="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex flex-col items-center justify-center p-4 cursor-pointer">
+                <div onclick="event.stopPropagation()" class="bg-white rounded-3xl p-5 shadow-2xl max-w-lg w-full relative cursor-default">
+                    <button onclick="window.closeZoomImage()" class="absolute -top-12 right-0 text-white hover:text-slate-300 text-3xl">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                    
+                    <div class="text-center mb-3">
+                        <span class="bg-indigo-100 text-indigo-700 text-xs px-3 py-1 rounded-full font-black">
+                            ${z.stepIndex + 1}枚目のえ
+                        </span>
+                    </div>
+                    
+                    <div class="aspect-square w-full rounded-2xl overflow-hidden border border-slate-200 bg-white shadow-inner mb-4">
+                        <img src="${z.image}" class="w-full h-full object-contain">
+                    </div>
+
+                    <div class="text-center">
+                        <div class="text-xs text-slate-400 font-black mb-1">おなまえの文字数</div>
+                        <div class="flex justify-center gap-1">
+                            ${Array.from({ length: z.textLength }).map(() => `
+                                <span class="w-5 h-5 rounded-full bg-slate-700 inline-block text-white text-xs text-center leading-5">●</span>
+                            `).join('')}
+                        </div>
+                        <span class="text-[10px] text-slate-400 font-bold mt-1 block">(${z.textLength}もじ)</span>
+                    </div>
+
+                    <div class="mt-4 text-center">
+                        <button onclick="window.closeZoomImage()" class="bg-slate-800 hover:bg-slate-700 text-white font-extrabold text-xs px-5 py-2 rounded-xl transition-all">
+                            とじる
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
     }
 
     // アーカイブ詳細モーダル
@@ -1275,18 +1415,18 @@
 
         const arch = state.selectedArchive;
         
-        // 削除ボタン・エリアの出し分けUI
+        // 削除確認エリアの出し分け
         let deleteAreaHtml = '';
         if (state.isConfirmingDelete) {
             deleteAreaHtml = `
                 <div class="bg-rose-50 border border-rose-200 rounded-xl p-3 flex flex-col sm:flex-row items-center justify-between gap-3 animate-pulse">
-                    <span class="text-xs font-black text-rose-700">⚠️ 本当にこの作品をさくじょしてもいいですか？</span>
+                    <span class="text-xs font-black text-rose-700">⚠️ 本当にさくじょしますか？データはもどりません。</span>
                     <div class="flex gap-2">
                         <button onclick="window.deleteArchive()" class="bg-rose-600 hover:bg-rose-700 text-white font-extrabold px-4 py-1.5 rounded-lg text-xs transition-colors flex items-center gap-1">
-                            <i class="fa-solid fa-trash-can"></i> はい、けします
+                            <i class="fa-solid fa-trash-can"></i> けす
                         </button>
                         <button onclick="window.setConfirmDelete(false)" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-extrabold px-4 py-1.5 rounded-lg text-xs transition-colors">
-                            キャンセル
+                            やめる
                         </button>
                     </div>
                 </div>
@@ -1295,7 +1435,7 @@
             deleteAreaHtml = `
                 <button onclick="window.setConfirmDelete(true)" class="text-slate-400 hover:text-rose-600 font-bold text-xs flex items-center gap-1 py-2 px-3 rounded-lg hover:bg-rose-50 transition-all">
                     <i class="fa-regular fa-trash-can"></i>
-                    <span>この作品をさくじょする</span>
+                    <span>このさくひんを消去する</span>
                 </button>
             `;
         }
@@ -1335,13 +1475,14 @@
                             ${arch.drawings.map((draw, index) => {
                                 const detail = arch.details[index];
                                 return `
-                                    <div class="bg-white border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between">
+                                    <div class="bg-white border rounded-2xl p-3.5 shadow-sm flex flex-col justify-between cursor-pointer hover:scale-[1.02] transition-transform"
+                                        onclick="window.showZoomImage('${draw.image}', ${index}, ${draw.name.length})">
                                         <div class="flex justify-between items-center mb-2">
                                             <span class="bg-slate-100 text-slate-600 text-[10px] font-black px-2 py-0.5 rounded-full">
                                                 ${index + 1}枚目
                                             </span>
                                             <span class="text-xs font-black ${detail.isOk ? 'text-emerald-500' : 'text-rose-500'}">
-                                                ${detail.isOk ? '◯ つながりOK' : '❌ エラー'}
+                                                ${detail.isOk ? '◯ オッケー' : '❌ エラー'}
                                             </span>
                                         </div>
 
@@ -1368,7 +1509,6 @@
                     </div>
 
                     <div class="p-4 border-t border-slate-100 flex flex-col sm:flex-row justify-between items-center gap-3 bg-slate-50">
-                        <!-- 削除操作エリア -->
                         <div class="w-full sm:w-auto">
                             ${deleteAreaHtml}
                         </div>
@@ -1386,7 +1526,7 @@
     <!-- ローディングのプレースホルダー -->
     <div class="flex-1 flex flex-col items-center justify-center p-8 text-center bg-[#fefcf0]">
         <div class="w-16 h-16 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4"></div>
-        <p class="text-lg font-bold text-slate-600">アプリケーションの準備中...</p>
+        <p class="text-lg font-bold text-slate-600">しゅんびしています...</p>
     </div>
 </div>
 
@@ -1394,7 +1534,7 @@
 <footer class="bg-slate-900 text-slate-400 py-6 text-center text-xs font-bold border-t border-slate-800">
     <div class="max-w-4xl mx-auto px-4 space-y-2">
         <p class="text-slate-500">
-            お絵かきしりとりゲーム ｜ 12文字をひらめきで繋ごう！
+            お絵かきしりとりギャラリー ｜ 12文字をひらめきで繋ごう！
         </p>
         <p>© 2026 E-Shiritori Challenge. All rights reserved.</p>
     </div>
