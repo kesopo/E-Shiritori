@@ -54,12 +54,16 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
     import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
     import { getFirestore, doc, getDoc, setDoc, addDoc, collection, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+    import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-storage.js";
 
     // Firebaseの初期設定
     let db = null;
     let auth = null;
+    let storage = null;
     let user = null;
     const appId = typeof __app_id !== 'undefined' ? __app_id : 'eshiritori-app-id';
+    // ローカル限定モード（true の場合は Firebase 初期化・クラウド保存を行わない）
+    const FORCE_LOCAL = true;
 
     // ひらがなリスト（お題生成用）
     const HIRAGANA_POOL = [
@@ -140,6 +144,212 @@
         }
     }
 
+    // ===== ドラフト保存 / 復元 =====
+    async function saveDraft(auto = false) {
+        const draft = {
+            savedAt: new Date().toISOString(),
+            screen: state.screen,
+            currentStep: state.currentStep,
+            startChar: state.startChar,
+            endChar: state.endChar,
+            drawings: state.drawings,
+            currentInputName: currentInputName
+        };
+
+        try {
+            localStorage.setItem('shiritori_draft', JSON.stringify(draft));
+        } catch (e) {
+            console.error('Local draft save failed', e);
+        }
+
+        // クラウド保存: 自動保存(auto=true)はクラウドに画像をアップロードしない。
+        if (!auto && db && user && !FORCE_LOCAL) {
+            try {
+                const uploaded = await uploadImagesIfNeeded(draft.drawings, `drafts/${user.uid}`);
+                const toSave = { ...draft, drawings: uploaded.map(d => ({ ...d })) , uid: user.uid };
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'shiritori_drafts', user.uid);
+                await setDoc(docRef, toSave);
+            } catch (e) {
+                console.error('Cloud draft save failed', e);
+            }
+        }
+
+        if (!auto) showToast('中断用の下書きを保存しました');
+    }
+
+    function restoreDraft(draft) {
+        if (!draft) return;
+        state.screen = draft.screen || 'game';
+        state.currentStep = typeof draft.currentStep === 'number' ? draft.currentStep : 0;
+        state.startChar = draft.startChar || state.startChar;
+        state.endChar = draft.endChar || state.endChar;
+        state.drawings = draft.drawings || [];
+        currentInputName = draft.currentInputName || '';
+        draftCandidate = null;
+        state.isConfirmingQuit = false;
+        render();
+        if (state.screen === 'game') {
+            initCanvas();
+        }
+    }
+
+    async function clearDraft() {
+        localStorage.removeItem('shiritori_draft');
+        draftCandidate = null;
+        if (db && user && !FORCE_LOCAL) {
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'shiritori_drafts', user.uid);
+                await deleteDoc(docRef);
+            } catch (e) {
+                console.error('Cloud draft delete failed', e);
+            }
+        }
+        render();
+    }
+
+    window.resumeDraft = function() {
+        if (draftCandidate) {
+            restoreDraft(draftCandidate);
+            showToast('下書きを復元しました');
+        }
+        render();
+    };
+
+    window.discardDraft = async function() {
+        await clearDraft();
+        showToast('下書きを削除しました');
+    };
+
+    // ===== Storage アップロード関連ユーティリティ =====
+    function dataURLToBlob(dataURL) {
+        const parts = dataURL.split(',');
+        const meta = parts[0].match(/:(.*?);/);
+        const mime = meta ? meta[1] : 'image/png';
+        const bstr = atob(parts[1]);
+        let n = bstr.length;
+        const u8arr = new Uint8Array(n);
+        while (n--) {
+            u8arr[n] = bstr.charCodeAt(n);
+        }
+        return new Blob([u8arr], { type: mime });
+    }
+
+    function resizeDataUrl(dataUrl, maxWidth = 1200, quality = 0.8) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+                const ratio = Math.min(1, maxWidth / img.width);
+                const canvas2 = document.createElement('canvas');
+                canvas2.width = Math.round(img.width * ratio);
+                canvas2.height = Math.round(img.height * ratio);
+                const ctx2 = canvas2.getContext('2d');
+                ctx2.fillStyle = '#ffffff';
+                ctx2.fillRect(0, 0, canvas2.width, canvas2.height);
+                ctx2.drawImage(img, 0, 0, canvas2.width, canvas2.height);
+                resolve(canvas2.toDataURL('image/jpeg', quality));
+            };
+            img.onerror = () => resolve(dataUrl);
+            img.src = dataUrl;
+        });
+    }
+
+    // simple rate limit / abuse protection
+    let lastCloudUploadTime = 0;
+    let uploadCountThisHour = 0;
+    let uploadHourWindowStart = Date.now();
+    const MAX_UPLOADS_PER_HOUR = 500; // safety cap
+
+    function canPerformCloudUpload() {
+        const now = Date.now();
+        if (now - uploadHourWindowStart > 3600 * 1000) {
+            uploadHourWindowStart = now; uploadCountThisHour = 0;
+        }
+        if (uploadCountThisHour >= MAX_UPLOADS_PER_HOUR) return false;
+        if (now - lastCloudUploadTime < 3000) return false; // 3秒以内の連続アップロードを抑制
+        return true;
+    }
+
+    async function uploadSingleDataUrl(pathPrefix, index, dataUrl) {
+        if (!storage) throw new Error('Storage not initialized');
+        // downscale if large
+        let resized = dataUrl;
+        const blob0 = dataURLToBlob(dataUrl);
+        if (blob0.size > 1024 * 1024 * 3) { // >3MB
+            resized = await resizeDataUrl(dataUrl, 1200, 0.7);
+        }
+        const blob = dataURLToBlob(resized);
+        const filename = `${pathPrefix}/${index}.jpg`;
+        const sRef = storageRef(storage, filename);
+        await uploadBytes(sRef, blob, { contentType: blob.type });
+        const url = await getDownloadURL(sRef);
+        lastCloudUploadTime = Date.now();
+        uploadCountThisHour++;
+        return url;
+    }
+
+    async function uploadImagesIfNeeded(drawings, pathPrefix) {
+        if (typeof FORCE_LOCAL !== 'undefined' && FORCE_LOCAL) {
+            // ローカル専用モードではクラウドにアップしない（dataURL はローカル保存のまま）
+            return drawings.map(d => ({ ...d }));
+        }
+        if (!drawings || drawings.length === 0) return drawings;
+        if (!canPerformCloudUpload()) {
+            console.warn('Cloud upload suppressed by rate limiter');
+            return drawings.map(d => ({ ...d, image: d.image && d.image.startsWith('data:') ? null : d.image }));
+        }
+        const results = [];
+        for (let i = 0; i < drawings.length; i++) {
+            const d = drawings[i];
+            if (!d || !d.image) { results.push(d); continue; }
+            if (typeof d.image === 'string' && d.image.startsWith('data:')) {
+                try {
+                    const url = await uploadSingleDataUrl(pathPrefix, i, d.image);
+                    results.push({ ...d, image: url });
+                } catch (e) {
+                    console.error('Image upload failed', e);
+                    results.push({ ...d, image: null });
+                }
+            } else {
+                results.push(d);
+            }
+        }
+        return results;
+    }
+
+    function renderDraftRestoreModal() {
+        const modalId = 'draft-restore-container';
+        let container = document.getElementById(modalId);
+        if (!container) {
+            container = document.createElement('div');
+            container.id = modalId;
+            document.body.appendChild(container);
+        }
+
+        if (!draftCandidate) {
+            container.innerHTML = '';
+            return;
+        }
+
+        const d = draftCandidate;
+        container.innerHTML = `
+            <div class="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+                <div class="bg-white rounded-3xl p-6 shadow-2xl max-w-sm w-full text-center border-4 border-indigo-100">
+                    <div class="w-12 h-12 rounded-full bg-indigo-50 text-indigo-600 flex items-center justify-center mx-auto text-2xl mb-3">
+                        <i class="fa-solid fa-save"></i>
+                    </div>
+                    <h3 class="text-lg font-black text-slate-800 mb-1">下書きがあります</h3>
+                    <p class="text-xs text-slate-400 font-bold mb-4">前回中断した下書きを復元しますか？</p>
+                    <div class="text-xs text-slate-400 mb-3">保存日時: ${d.savedAt}</div>
+                    <div class="flex flex-col gap-2">
+                        <button onclick="window.resumeDraft()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-black py-2.5 rounded-2xl text-sm transition-all active:scale-95">下書きを復元する</button>
+                        <button onclick="window.discardDraft()" class="w-full bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold py-2.5 rounded-2xl text-sm transition-all">下書きを削除する</button>
+                        <button onclick="(function(){draftCandidate=null;renderDraftRestoreModal();})();" class="w-full bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-2.5 rounded-2xl text-sm transition-all">あとで</button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
     // 2. アーカイブの読み込み
     async function loadArchives() {
         if (!db || !user) {
@@ -175,11 +385,17 @@
 
     // 3. Firebase初期化＆ログイン認証ライフサイクル
     async function initFirebaseAndAuth() {
+        if (typeof FORCE_LOCAL !== 'undefined' && FORCE_LOCAL) {
+            console.log('FORCE_LOCAL is enabled — running in local-only mode. Firebase not initialized.');
+            render();
+            return;
+        }
         try {
             if (typeof __firebase_config !== 'undefined') {
                 const firebaseConfig = JSON.parse(__firebase_config);
                 const app = initializeApp(firebaseConfig);
                 db = getFirestore(app);
+                storage = getStorage(app);
                 auth = getAuth(app);
                 
                 onAuthStateChanged(auth, async (u) => {
@@ -211,8 +427,25 @@
     window.onload = function() {
         initLocalCache(); // まず手元のキャッシュを読み込んで仮表示
         render();
+        checkForDraft();
         initFirebaseAndAuth(); // その後非同期でFirebase連携を開始して最新化
     };
+
+    // ドラフト候補（ロード時に確認用）
+    let draftCandidate = null;
+
+    function checkForDraft() {
+        const d = localStorage.getItem('shiritori_draft');
+        if (d) {
+            try {
+                draftCandidate = JSON.parse(d);
+                // 自動でモーダルを開かず、トップ画面で再開ボタンを表示する
+                render();
+            } catch (e) {
+                console.error('Draft parse error', e);
+            }
+        }
+    }
 
     // アーカイブの保存
     async function saveArchiveToDB(archiveData) {
@@ -222,8 +455,11 @@
 
         if (db && user) {
             try {
+                // 画像が dataURL の場合は Storage にアップロードして URL に差し替える
+                const uploaded = await uploadImagesIfNeeded(archiveData.drawings, `archives/${user.uid}/${Date.now()}`);
+                const toSave = { ...archiveData, drawings: uploaded };
                 const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'shiritori_archives');
-                await addDoc(colRef, archiveData);
+                await addDoc(colRef, toSave);
                 await loadArchives();
             } catch (error) {
                 console.error("Error saving to Firestore:", error);
@@ -259,7 +495,11 @@
             const current = drawings[i];
             const name = current.name || '';
             const first = name.charAt(0);
-            const last = name.charAt(name.length - 1);
+            // 末尾が長音記号『ー』の場合は直前の文字を末尾として扱う
+            let last = name.charAt(name.length - 1);
+            if (last === 'ー' && name.length >= 2) {
+                last = name.charAt(name.length - 2);
+            }
 
             let isOk = true;
             let reason = '';
@@ -410,6 +650,7 @@
         }
 
         state.drawings[state.currentStep].name = currentInputName;
+        try { saveDraft(true); } catch (e) { console.error(e); }
 
         if (state.currentStep < 11) {
             state.currentStep++;
@@ -560,6 +801,8 @@
             drawHistory.shift();
         }
         drawHistory.push(canvas.toDataURL());
+        // 自動下書き保存（軽量フラグ）
+        try { saveDraft(true); } catch (e) { console.error(e); }
     }
 
     function undoDraw() {
@@ -736,58 +979,230 @@
         renderKeyboard();
     };
 
-    // あいうえお表キーボード
+    // フリック入力キーボード
+    let keyboardMode = 'seion'; // seion / dakuon / yoon
+    const pointerFlickState = {}; // pointerId -> {x,y,key}
+
+    const FLICK_KEYMAP = {
+        // 配置: 上=右の文字, 左=上の文字, 中=中心, 右=下の文字, 下=左の文字
+        'あ': { center: 'あ', up: 'う', right: 'え', down: 'お', left: 'い' },
+        'か': { center: 'か', up: 'く', right: 'け', down: 'こ', left: 'き' },
+        'さ': { center: 'さ', up: 'す', right: 'せ', down: 'そ', left: 'し' },
+        'た': { center: 'た', up: 'つ', right: 'て', down: 'と', left: 'ち' },
+        'な': { center: 'な', up: 'ぬ', right: 'ね', down: 'の', left: 'に' },
+        'は': { center: 'は', up: 'ふ', right: 'へ', down: 'ほ', left: 'ひ' },
+        'ま': { center: 'ま', up: 'む', right: 'め', down: 'も', left: 'み' },
+        'や': { center: 'や', up: 'ゆ', right: 'ょ', down: 'よ', left: 'ゃ' },
+        'ら': { center: 'ら', up: 'る', right: 'れ', down: 'ろ', left: 'り' },
+        'わ': { center: 'わ', up: 'ん', right: 'ー', down: 'ゎ', left: 'を' }
+    };
+
+    const DAKUON_CONV = {
+        'か': 'が','き':'ぎ','く':'ぐ','け':'げ','こ':'ご',
+        'さ':'ざ','し':'じ','す':'ず','せ':'ぜ','そ':'ぞ',
+        'た':'だ','ち':'ぢ','つ':'づ','て':'で','と':'ど',
+        'は':'ば','ひ':'び','ふ':'ぶ','へ':'べ','ほ':'ぼ'
+    };
+
+    const PAA_CONV = {
+        'は':'ぱ','ひ':'ぴ','ふ':'ぷ','へ':'ぺ','ほ':'ぽ'
+    };
+
+    const YOON_CONV = {
+        'あ':'ぁ','い':'ぃ','う':'ぅ','え':'ぇ','お':'ぉ',
+        'や':'ゃ','ゆ':'ゅ','よ':'ょ','つ':'っ','わ':'ゎ'
+    };
+
+    function applyKeyboardMode(ch) {
+        if (!ch) return ch;
+        if (keyboardMode === 'dakuon') {
+            return DAKUON_CONV[ch] || PAA_CONV[ch] || ch;
+        }
+        if (keyboardMode === 'yoon') {
+            return YOON_CONV[ch] || ch;
+        }
+        return ch;
+    }
+
+    function getCharForFlick(baseKey, dir) {
+        const map = FLICK_KEYMAP[baseKey] || { center: baseKey };
+        const raw = map[dir] || map.center;
+        return applyKeyboardMode(raw);
+    }
+
+    // 最後に入力した文字の濁音/半濁音/小文字を順に切替
+    window.cycleLastCharVariant = function() {
+        if (!currentInputName || currentInputName.length === 0) {
+            showToast('まず文字を入力してください');
+            return;
+        }
+
+        const last = currentInputName.charAt(currentInputName.length - 1);
+        const base = normalizeChar(last);
+
+        // 候補リストを作る（重複を除く）
+        const candidates = [base];
+        const daku = DAKUON_CONV[base];
+        const pa = PAA_CONV[base];
+        const small = YOON_CONV[base];
+        if (daku && !candidates.includes(daku)) candidates.push(daku);
+        if (pa && !candidates.includes(pa)) candidates.push(pa);
+        if (small && !candidates.includes(small)) candidates.push(small);
+
+        // 現在の位置を探す
+        let idx = candidates.indexOf(last);
+        if (idx === -1) {
+            // last 文字が候補にない場合、基底から始める
+            idx = 0;
+        }
+
+        const next = candidates[(idx + 1) % candidates.length];
+        currentInputName = currentInputName.slice(0, -1) + next;
+        render();
+    };
+
+    window.cycleKeyboardMode = function() {
+        if (keyboardMode === 'seion') keyboardMode = 'dakuon';
+        else if (keyboardMode === 'dakuon') keyboardMode = 'yoon';
+        else keyboardMode = 'seion';
+        renderKeyboard();
+        showToast(`切替: ${keyboardMode}`);
+    };
+    window.flickPointerDown = function(e, baseKey) {
+        e.preventDefault();
+        const id = e.pointerId || 'mouse';
+        pointerFlickState[id] = { x: e.clientX, y: e.clientY, key: baseKey };
+        try { e.target.setPointerCapture && e.target.setPointerCapture(e.pointerId); } catch (err) {}
+        // 初期プレビュー表示（中心文字）
+        const ch = applyKeyboardMode((FLICK_KEYMAP[baseKey] && FLICK_KEYMAP[baseKey].center) || baseKey);
+        showFlickPreview(e.clientX, e.clientY, ch);
+    };
+
+    window.flickPointerMove = function(e, baseKey) {
+        const id = e.pointerId || 'mouse';
+        const stateObj = pointerFlickState[id];
+        if (!stateObj) return;
+        const dx = e.clientX - stateObj.x;
+        const dy = e.clientY - stateObj.y;
+        const absX = Math.abs(dx), absY = Math.abs(dy);
+        const TH = 20;
+        let dir = 'center';
+        if (Math.max(absX, absY) > TH) {
+            if (absX > absY) dir = dx > 0 ? 'right' : 'left';
+            else dir = dy > 0 ? 'down' : 'up';
+        }
+        const ch = getCharForFlick(baseKey, dir);
+        // プレビューは押した場所に固定して表示
+        showFlickPreview(stateObj.x, stateObj.y, ch);
+    };
+
+    window.flickPointerUp = function(e, baseKey) {
+        e.preventDefault();
+        const id = e.pointerId || 'mouse';
+        const stateObj = pointerFlickState[id];
+        if (!stateObj) return;
+        const dx = e.clientX - stateObj.x;
+        const dy = e.clientY - stateObj.y;
+        const absX = Math.abs(dx), absY = Math.abs(dy);
+        const TH = 20;
+        let dir = 'center';
+        if (Math.max(absX, absY) > TH) {
+            if (absX > absY) dir = dx > 0 ? 'right' : 'left';
+            else dir = dy > 0 ? 'down' : 'up';
+        }
+        const ch = getCharForFlick(baseKey, dir);
+        window.handleNameInput(ch);
+        delete pointerFlickState[id];
+        try { e.target.releasePointerCapture && e.target.releasePointerCapture(e.pointerId); } catch (err) {}
+        hideFlickPreview();
+    };
+
+    window.flickPointerCancel = function(e) {
+        const id = e.pointerId || 'mouse';
+        delete pointerFlickState[id];
+        hideFlickPreview();
+    };
+
+    function showFlickPreview(x, y, ch) {
+        let el = document.getElementById('flick-preview');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'flick-preview';
+            el.style.position = 'fixed';
+            el.style.zIndex = 9999;
+            el.style.pointerEvents = 'none';
+            el.style.transition = 'transform 0.08s ease, opacity 0.12s ease';
+            el.style.opacity = '0';
+            el.style.display = 'flex';
+            el.style.alignItems = 'center';
+            el.style.justifyContent = 'center';
+            el.style.background = 'white';
+            el.style.border = '2px solid rgba(15,23,42,0.08)';
+            el.style.boxShadow = '0 6px 18px rgba(2,6,23,0.12)';
+            el.style.borderRadius = '12px';
+            el.style.width = '64px';
+            el.style.height = '64px';
+            el.style.fontSize = '28px';
+            el.style.fontWeight = '800';
+            el.style.color = '#0f172a';
+            document.body.appendChild(el);
+        }
+        el.innerText = ch;
+        const offsetY = 48;
+        el.style.left = `${x}px`;
+        el.style.top = `${y - offsetY}px`;
+        el.style.transform = 'translate(-50%, -50%) scale(1)';
+        el.style.opacity = '1';
+    }
+
+    function hideFlickPreview() {
+        const el = document.getElementById('flick-preview');
+        if (el) {
+            el.style.opacity = '0';
+            setTimeout(() => el.remove(), 150);
+        }
+    }
+
     function renderKeyboard() {
         const container = document.getElementById('keyboard-container');
         if (!container) return;
 
-        const tabHtml = `
-            <div class="flex justify-center gap-2 mb-3 bg-slate-100 p-1.5 rounded-xl">
-                <button onclick="window.switchTab('seion')" class="flex-1 py-2 text-xs md:text-sm font-bold rounded-lg transition-all ${activeKeyboardTab === 'seion' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}">清音 (あ-ん)</button>
-                <button onclick="window.switchTab('dakuon')" class="flex-1 py-2 text-xs md:text-sm font-bold rounded-lg transition-all ${activeKeyboardTab === 'dakuon' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}">濁音・半濁音</button>
-                <button onclick="window.switchTab('yoon')" class="flex-1 py-2 text-xs md:text-sm font-bold rounded-lg transition-all ${activeKeyboardTab === 'yoon' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}">拗音・小文字</button>
-            </div>
-        `;
+        const rows = [
+            ['あ','か','さ'],
+            ['た','な','は'],
+            ['ま','や','ら'],
+            ['toggle','わ','del']
+        ];
 
-        const rows = HIRAGANA_TABLES[activeKeyboardTab];
-        let keysHtml = '';
-
-        if (activeKeyboardTab === 'seion') {
-            keysHtml = `
-                <div class="overflow-x-auto pb-2">
-                    <div class="grid grid-cols-10 gap-1.5 min-w-[560px] md:min-w-0 justify-center">
-            `;
-            rows.forEach(row => {
-                row.forEach(char => {
-                    if (char.trim() === '' || char === '　') {
-                        keysHtml += `<div class="aspect-square opacity-0 pointer-events-none select-none"></div>`;
-                    } else {
-                        keysHtml += `
-                            <button onclick="window.handleNameInput('${char}')" 
-                                class="aspect-square flex items-center justify-center bg-white border border-slate-200 hover:border-indigo-400 active:bg-indigo-50 rounded-xl text-base font-bold shadow-sm transition-all hover:scale-105 active:scale-95 text-slate-700">
-                                ${char}
-                            </button>
-                        `;
-                    }
-                });
-            });
-            keysHtml += `</div></div>`;
-        } else {
-            keysHtml = `<div class="grid grid-cols-5 gap-1.5 justify-center max-w-md mx-auto">`;
-            rows.forEach(row => {
-                row.forEach(char => {
-                    keysHtml += `
-                        <button onclick="window.handleNameInput('${char}')" 
-                            class="aspect-square flex items-center justify-center bg-white border border-slate-200 hover:border-indigo-400 active:bg-indigo-50 rounded-xl text-base font-bold shadow-sm transition-all hover:scale-105 active:scale-95 text-slate-700">
-                            ${char}
-                        </button>
-                    `;
-                });
-            });
-            keysHtml += `</div>`;
+        let html = `<div class="space-y-2">`;
+        for (let r = 0; r < rows.length; r++) {
+            html += `<div class="flex justify-center gap-2">`;
+            for (let c = 0; c < rows[r].length; c++) {
+                const key = rows[r][c];
+                if (key === 'toggle') {
+                    // 左下: 最後の文字に対して濁音/半濁音/小文字を切替
+                    html += `
+                        <button onclick="window.cycleLastCharVariant()" class="flex-1 py-3 rounded-2xl bg-slate-50 border border-slate-200 text-sm font-black">
+                            /゜<div class="text-xs text-slate-400">切替</div>
+                        </button>`;
+                } else if (key === 'del') {
+                    html += `
+                        <button onclick="window.deleteLastChar()" class="flex-1 py-3 rounded-2xl bg-rose-50 border border-slate-200 text-sm font-black">
+                            &lt;<div class="text-xs text-slate-400">戻る</div>
+                        </button>`;
+                } else {
+                    const display = (FLICK_KEYMAP[key] && FLICK_KEYMAP[key].center) || key;
+                    html += `
+                        <button onpointerdown="window.flickPointerDown(event, '${key}')" onpointermove="window.flickPointerMove(event, '${key}')" onpointerup="window.flickPointerUp(event, '${key}')" onpointercancel="window.flickPointerCancel(event)" class="flex-1 py-4 rounded-2xl bg-white border border-slate-200 text-xl font-black select-none">
+                            <div class="text-lg">${display}</div>
+                        </button>`;
+                }
+            }
+            html += `</div>`;
         }
+        html += `</div>`;
 
-        container.innerHTML = tabHtml + keysHtml;
+        container.innerHTML = html;
     }
 
     // ロードマップコンポーネント（画像をタップすると拡大モーダルが表示される仕組み）
@@ -921,6 +1336,12 @@
                         </button>
                     </div>
 
+                    ${draftCandidate ? `
+                    <div class="w-full max-w-2xl mb-6 flex gap-3 justify-center">
+                        <button onclick="window.resumeDraft()" class="bg-yellow-500 hover:bg-yellow-600 text-white px-8 py-3 rounded-2xl font-bold shadow">中断を再開する</button>
+                    </div>
+                    ` : ''}
+
                     <!-- ルール説明（グラフィカル版） -->
                     <div class="bg-white border border-slate-200 p-6 rounded-3xl shadow-sm w-full max-w-2xl mb-12">
                         <h4 class="text-indigo-950 font-black text-base mb-5 flex items-center gap-2 pb-2 border-b">
@@ -1027,51 +1448,23 @@
                         ${getRoadmapHtml()}
 
                         <!-- ビジュアルガイダンス (スッキリUI) -->
+                        ${state.currentStep === 0 ? `
                         <div class="bg-white border border-slate-200 rounded-3xl p-4 text-center mb-6 shadow-sm flex flex-col items-center justify-center gap-2">
-                            ${state.currentStep === 0 ? `
                                 <div class="flex items-center gap-2 bg-indigo-50 border border-indigo-100 px-4 py-2 rounded-2xl">
                                     <span class="text-xs font-black text-indigo-500">1枚目のお題</span>
                                     <span class="text-3xl text-indigo-600 font-black">「${state.startChar}」</span>
                                 </div>
                                 <h2 class="text-base font-black text-slate-700">から始まる絵を描こう！</h2>
-                            ` : isLast ? `
+                        </div>
+                        ` : isLast ? `
+                        <div class="bg-white border border-slate-200 rounded-3xl p-4 text-center mb-6 shadow-sm flex flex-col items-center justify-center gap-2">
                                 <div class="flex items-center gap-2 bg-pink-50 border border-pink-100 px-4 py-2 rounded-2xl animate-pulse">
                                     <span class="text-xs font-black text-pink-500">最後のお題</span>
                                     <span class="text-3xl text-pink-600 font-black">「${state.endChar}」</span>
                                 </div>
                                 <h2 class="text-base font-black text-slate-700">で終わるよう絵を描こう！</h2>
-                            ` : `
-                                <div class="flex flex-col items-center gap-1.5 w-full">
-                                    <span class="text-xs font-black text-amber-600 bg-amber-50 border border-amber-100 px-3 py-1 rounded-full flex items-center gap-1">
-                                        <i class="fa-solid fa-lightbulb"></i> 前の人の絵をみて推理しよう！
-                                    </span>
-                                    <div class="flex items-center justify-center gap-3 mt-1.5">
-                                        <!-- 直前の絵をクイック表示 -->
-                                        ${prevDrawing ? `
-                                            <div onclick="window.showZoomImage('${prevDrawing.image}', ${state.currentStep - 1}, ${prevDrawing.name.length})" 
-                                                class="w-14 h-14 rounded-xl overflow-hidden border-2 border-slate-300 shadow cursor-pointer active:scale-95 transition-all relative group flex-shrink-0 bg-white">
-                                                <img src="${prevDrawing.image}" class="w-full h-full object-cover">
-                                                <div class="absolute inset-0 bg-black/40 flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition-opacity">
-                                                    <i class="fa-solid fa-search-plus text-xs"></i>
-                                                </div>
-                                            </div>
-                                            <div class="text-left">
-                                                <div class="text-[10px] text-slate-400 font-bold">前の絵のなまえ</div>
-                                                <div class="flex gap-1 items-center mt-0.5">
-                                                    ${Array.from({ length: prevDrawing.name.length }).map(() => `
-                                                        <span class="w-3.5 h-3.5 rounded-full bg-slate-700 inline-block text-white text-[8px] text-center leading-3.5">●</span>
-                                                    `).join('')}
-                                                    <span class="text-[10px] text-slate-400 ml-1">(${prevDrawing.name.length}もじ)</span>
-                                                </div>
-                                                <span class="text-[9px] text-indigo-500 font-black cursor-pointer hover:underline" onclick="window.showZoomImage('${prevDrawing.image}', ${state.currentStep - 1}, ${prevDrawing.name.length})">
-                                                    タップして大きくみる <i class="fa-solid fa-search-plus text-[8px]"></i>
-                                                </span>
-                                            </div>
-                                        ` : ''}
-                                    </div>
-                                </div>
-                            `}
                         </div>
+                        ` : ''}
 
                         <div class="flex flex-col items-center">
                             <div class="w-full aspect-square max-w-[420px] bg-white border-4 border-slate-800 rounded-3xl shadow-lg overflow-hidden relative">
@@ -1099,7 +1492,7 @@
                     <div class="mt-8 flex justify-center">
                         <button onclick="window.goToInputScreen()" 
                             class="w-full max-w-sm bg-gradient-to-r from-indigo-500 to-indigo-600 hover:from-indigo-600 hover:to-indigo-700 text-white font-black py-4 px-8 rounded-3xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 text-lg flex items-center justify-center gap-2">
-                            <span>かけおわった！おなまえを入力する</span>
+                            <span>名前を入力する</span>
                             <i class="fa-solid fa-arrow-right"></i>
                         </button>
                     </div>
@@ -1141,7 +1534,7 @@
                                 (${currentInputName.length}もじ)
                             </div>
 
-                            <div class="w-full max-w-sm text-center py-2.5 px-4 bg-slate-50 rounded-2xl border border-slate-200 min-h-[48px] flex items-center justify-center gap-1 flex-wrap">
+                            <div class="w-full max-w-sm text-center py-1 px-3 bg-transparent rounded-2xl border-0 min-h-0 flex items-center justify-center gap-1 flex-wrap">
                                 ${currentInputName ? `
                                     <span class="text-2xl font-black text-indigo-700 tracking-wider">${currentInputName}</span>
                                 ` : `
@@ -1153,15 +1546,9 @@
                         <div id="keyboard-container" class="bg-white p-4 rounded-3xl border border-slate-200 shadow-sm max-w-md mx-auto"></div>
                     </div>
 
-                    <div class="mt-8 flex justify-center gap-3 w-full max-w-md mx-auto">
-                        <button onclick="window.deleteLastChar()" 
-                            class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-black px-6 py-4 rounded-2xl transition-all flex items-center gap-2 border border-slate-200">
-                            <i class="fa-solid fa-delete-left"></i>
-                            <span>けす</span>
-                        </button>
-                        
+                    <div class="mt-4 flex justify-center gap-3 w-full max-w-md mx-auto">
                         <button onclick="window.confirmNameInput()" 
-                            class="flex-1 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white font-black py-4 px-8 rounded-2xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 flex items-center justify-center gap-2">
+                            class="w-full bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white font-black py-3 px-6 rounded-2xl shadow-lg hover:shadow-xl transition-all transform active:scale-95 flex items-center justify-center gap-2">
                             <span>しりとりを繋ぐ！</span>
                             <i class="fa-solid fa-check"></i>
                         </button>
@@ -1333,6 +1720,10 @@
                             class="w-full bg-rose-500 hover:bg-rose-600 text-white font-black py-2.5 rounded-2xl text-sm transition-all active:scale-95">
                             ゲームをやめる (トップへ)
                         </button>
+                        <button onclick="window.quitAndSaveConfirmed()" 
+                            class="w-full bg-yellow-400 hover:bg-yellow-500 text-yellow-950 font-black py-2.5 rounded-2xl text-sm transition-all active:scale-95">
+                            中断して保存する
+                        </button>
                         <button onclick="window.setConfirmQuit(false)" 
                             class="w-full bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-2.5 rounded-2xl text-xs transition-all">
                             お絵描きをつづける
@@ -1342,6 +1733,16 @@
             </div>
         `;
     }
+
+    window.quitAndSaveConfirmed = async function() {
+        await saveDraft(false);
+        state.screen = 'top';
+        state.isConfirmingQuit = false;
+        state.drawings = [];
+        checkForDraft();
+        render();
+        loadArchives();
+    };
 
     // ズームモーダル
     function renderZoomModal() {
